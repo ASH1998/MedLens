@@ -1,11 +1,14 @@
 import os
 import subprocess
 import tempfile
+from pathlib import Path
+from dotenv import load_dotenv
 
 # ===== CONFIG =====
-SQL_GZ_FILE = "effect_peds_19q2_v0.3_20211119.sql.gz"
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-POSTGRES_URI = "postgresql://medadmin:strongpassword@localhost:5432/medlens"
+SQL_GZ_FILE = "effect_peds_19q2_v0.3_20211119.sql.gz"
+POSTGRES_URI = os.getenv("POSTGRES_URI")
 
 # ==================
 

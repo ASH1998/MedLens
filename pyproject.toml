@@ -1,0 +1,13 @@
+[project]
+name = "medlens"
+version = "0.0.1.dev0"
+description = "An on-device polypharmacy drug interaction agent powered by fine-tuned Gemma 4 E2B"
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [
+    { name = "Ashutosh", email = "prog.mishra@gmail.com" },
+]
+dependencies = [
+    "python-dotenv",
+    "uv>=0.11.6",
+]
