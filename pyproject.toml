@@ -8,6 +8,8 @@ authors = [
     { name = "Ashutosh", email = "prog.mishra@gmail.com" },
 ]
 dependencies = [
+    "pandas>=3.0.2",
+    "psycopg[binary]>=3.3.3",
     "python-dotenv",
     "uv>=0.11.6",
 ]
