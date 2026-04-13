@@ -76,3 +76,4 @@ coverage/
 # TypeScript
 *.tsbuildinfo
 .mcp.json
+*.jsonl

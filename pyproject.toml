@@ -11,5 +11,6 @@ dependencies = [
     "pandas>=3.0.2",
     "psycopg[binary]>=3.3.3",
     "python-dotenv",
+    "tiktoken>=0.12.0",
     "uv>=0.11.6",
 ]
