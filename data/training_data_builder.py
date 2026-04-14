@@ -37,9 +37,9 @@ from dotenv import load_dotenv
 import psycopg
 import tiktoken
 from psycopg import sql
-from psycopg.types.json import Json
+from psycopg.types.json import Json  # kept for potential future use
 
-CHUNK_SIZE = 500  # rows fetched + inserted per batch
+CHUNK_SIZE = 2000  # rows fetched + inserted per batch
 
 # cl100k_base is GPT-4's BPE — not Gemma's, but within ~10% for English medical
 # text and has no model download. Good enough for filtering/bucketing decisions.
@@ -208,18 +208,30 @@ WITH suspect AS (
       AND prod_ai <> ''
     GROUP BY primaryid
     HAVING COUNT(DISTINCT prod_ai) BETWEEN %(min_drugs)s AND %(max_drugs)s
+    ORDER BY primaryid
+    LIMIT %(limit)s
 ),
+-- only aggregate rows matching suspect primaryids (not full tables)
 reacs AS (
-    SELECT primaryid, array_agg(DISTINCT pt) AS reactions
-    FROM faers.reac WHERE pt IS NOT NULL GROUP BY primaryid
+    SELECT r.primaryid, array_agg(DISTINCT r.pt) AS reactions
+    FROM faers.reac r
+    WHERE r.pt IS NOT NULL
+      AND r.primaryid IN (SELECT primaryid FROM suspect)
+    GROUP BY r.primaryid
 ),
 indis AS (
-    SELECT primaryid, array_agg(DISTINCT indi_pt) AS indications
-    FROM faers.indi WHERE indi_pt IS NOT NULL AND indi_pt <> '' GROUP BY primaryid
+    SELECT i.primaryid, array_agg(DISTINCT i.indi_pt) AS indications
+    FROM faers.indi i
+    WHERE i.indi_pt IS NOT NULL AND i.indi_pt <> ''
+      AND i.primaryid IN (SELECT primaryid FROM suspect)
+    GROUP BY i.primaryid
 ),
 outcs AS (
-    SELECT primaryid, array_agg(DISTINCT outc_cod) AS outcome_codes
-    FROM faers.outc WHERE outc_cod IS NOT NULL GROUP BY primaryid
+    SELECT o.primaryid, array_agg(DISTINCT o.outc_cod) AS outcome_codes
+    FROM faers.outc o
+    WHERE o.outc_cod IS NOT NULL
+      AND o.primaryid IN (SELECT primaryid FROM suspect)
+    GROUP BY o.primaryid
 )
 SELECT s.primaryid,
        s.drugs,
@@ -231,10 +243,9 @@ FROM suspect s
 LEFT JOIN reacs r USING (primaryid)
 LEFT JOIN indis i USING (primaryid)
 LEFT JOIN outcs o USING (primaryid)
-LEFT JOIN faers.demo d USING (primaryid)
-WHERE r.reactions IS NOT NULL              -- must have at least one reaction
-ORDER BY s.primaryid
-LIMIT %(limit)s;
+LEFT JOIN faers.demo d ON d.primaryid = s.primaryid
+WHERE r.reactions IS NOT NULL
+ORDER BY s.primaryid;
 """
 
 
@@ -466,25 +477,32 @@ def render_messages_type_b(
     return messages, think
 
 
+INSERT_COLS = (
+    "example_type", "source", "source_ref",
+    "drugs", "n_drugs", "pairs", "n_pairs",
+    "reactions", "indications", "outcome_codes", "severity",
+    "age", "sex",
+    "messages", "n_turns", "has_think", "think_trace",
+    "token_count", "thinking_token_count",
+    "split",
+)
+
 INSERT_SQL = f"""
-INSERT INTO {SCHEMA}.{TABLE} (
-    example_type, source, source_ref,
-    drugs, n_drugs, pairs, n_pairs,
-    reactions, indications, outcome_codes, severity,
-    age, sex,
-    messages, n_turns, has_think, think_trace,
-    token_count, thinking_token_count,
-    split
-) VALUES (
-    %s, %s, %s,
-    %s, %s, %s, %s,
-    %s, %s, %s, %s,
-    %s, %s,
-    %s, %s, %s, %s,
-    %s, %s,
-    %s
-);
+INSERT INTO {SCHEMA}.{TABLE} ({', '.join(INSERT_COLS)})
+VALUES ({', '.join('%s' for _ in INSERT_COLS)});
 """
+
+
+def _bulk_insert(conn, records: list[tuple]) -> None:
+    """Use COPY for bulk insert — 10-50x faster than executemany."""
+    if not records:
+        return
+    col_list = ", ".join(INSERT_COLS)
+    with conn.cursor() as cur:
+        with cur.copy(f"COPY {SCHEMA}.{TABLE} ({col_list}) FROM STDIN") as copy:
+            for rec in records:
+                copy.write_row(rec)
+    conn.commit()
 
 
 def _row_to_record(
@@ -508,10 +526,11 @@ def _row_to_record(
     tok_think = count_tokens(think) if has_think else None
     return (
         "multi_drug", "faers", str(primaryid),
-        Json(drugs), len(drugs), Json(pairs), len(pairs),
-        Json(reactions), Json(indications or []), Json(outcome_codes or []), severity,
+        json.dumps(drugs), len(drugs), json.dumps(pairs), len(pairs),
+        json.dumps(reactions), json.dumps(indications or []),
+        json.dumps(outcome_codes or []), severity,
         age_str, sex,
-        Json(messages), len(messages), has_think, think or None,
+        json.dumps(messages), len(messages), has_think, think or None,
         tok_total, tok_think,
         "train",
     )
@@ -557,9 +576,7 @@ def build_from_faers(
                 else:
                     records.append(rec)
 
-            with conn.cursor() as cur:
-                cur.executemany(INSERT_SQL, records)
-            conn.commit()
+            _bulk_insert(conn, records)
             inserted = len(records)
 
         print(f"Inserted {inserted:,} FAERS multi-drug training examples "
@@ -576,9 +593,7 @@ def build_from_faers(
             nonlocal inserted
             if not chunk:
                 return
-            with writer_conn.cursor() as wc:
-                wc.executemany(INSERT_SQL, chunk)
-            writer_conn.commit()
+            _bulk_insert(writer_conn, chunk)
             inserted += len(chunk)
             chunk.clear()
             print(f"  … {inserted:,} inserted so far", end="\r", flush=True)
@@ -708,8 +723,8 @@ def main() -> None:
                    help="Add indexes on faers source tables (run once before --build-faers)")
     p.add_argument("--build-faers", action="store_true",
                    help="Populate Type B multi-drug examples from FAERS")
-    p.add_argument("--limit", type=int, default=5000,
-                   help="Max FAERS cases to pull (default: 5000)")
+    p.add_argument("--limit", type=int, default=5000000,
+                   help="Max FAERS cases to pull (default: 5,000,000)")
     p.add_argument("--min-drugs", type=int, default=3)
     p.add_argument("--max-drugs", type=int, default=8)
     p.add_argument("--thinking-mode", choices=["never", "mixed", "always"],
