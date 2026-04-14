@@ -429,10 +429,33 @@ def _resolve_header_indices(header: list[str], target_cols: list[str]) -> tuple[
     return col_indices, missing
 
 
-def _copy_rows(copy, stream, col_indices: list[int | None]) -> int:
-    """Copy streamed rows into PostgreSQL and return the number of source rows seen."""
+def _load_existing_keys(conn, table_fqn: str, uq_cols: list[str]) -> set[tuple]:
+    """Load existing unique keys from DB into a set for cross-quarter dedup."""
+    uq_col_list = ", ".join(uq_cols)
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT {uq_col_list} FROM {table_fqn};")
+        rows = cur.fetchall()
+    if not rows:
+        return set()
+    keys = {tuple(str(v) if v is not None else None for v in row) for row in rows}
+    log.info("  Pre-loaded %s existing keys from %s.", f"{len(keys):,}", table_fqn)
+    return keys
+
+
+def _copy_rows_dedup(
+    copy, stream, col_indices: list[int | None], uq_indices: list[int],
+    seen: set[tuple] | None = None,
+) -> tuple[int, int]:
+    """
+    COPY rows into PostgreSQL, deduping in Python via seen-set on unique key columns.
+    Returns (raw_count, written_count).
+    """
+    if seen is None:
+        seen = set()
     raw_count = 0
+    written = 0
     for row in stream:
+        raw_count += 1
         vals = []
         for idx in col_indices:
             if idx is None or idx >= len(row):
@@ -440,45 +463,16 @@ def _copy_rows(copy, stream, col_indices: list[int | None]) -> int:
             else:
                 value = row[idx].strip()
                 vals.append(value if value else None)
+
+        # Build unique key from resolved vals (uq_indices are positions in target_cols)
+        key = tuple(vals[i] for i in uq_indices)
+        if key in seen:
+            continue
+        seen.add(key)
+
         copy.write_row(vals)
-        raw_count += 1
-    return raw_count
-
-
-def _load_table_via_staging(conn, table_fqn: str, defn: dict, col_list: str, col_indices: list[int | None], stream) -> tuple[int, int]:
-    """COPY into a temp staging table, then merge into the constrained target table."""
-    target_cols = list(defn["columns"].keys())
-    uq_cols = defn["unique_cols"]
-    temp_table = f"_staging_{defn['table']}"
-    raw_count = 0
-
-    with conn.cursor() as cur:
-        col_defs = ",\n".join(
-            f"    {col} {dtype}" for col, dtype in defn["columns"].items()
-        )
-        cur.execute(f"CREATE TEMP TABLE {temp_table} (\n{col_defs}\n) ON COMMIT DROP;")
-
-        with cur.copy(f"COPY {temp_table} ({col_list}) FROM STDIN") as copy:
-            raw_count = _copy_rows(copy, stream, col_indices)
-
-        conflict_cols = ", ".join(uq_cols)
-        select_cols = ", ".join(target_cols)
-        cur.execute(
-            f"INSERT INTO {table_fqn} ({col_list}) "
-            f"SELECT {select_cols} FROM {temp_table} "
-            f"ON CONFLICT ({conflict_cols}) DO NOTHING;"
-        )
-        inserted = cur.rowcount
-
-    return raw_count, inserted
-
-
-def _load_table_direct(conn, table_fqn: str, col_list: str, col_indices: list[int | None], stream) -> tuple[int, int]:
-    """COPY directly into the constrained target table."""
-    with conn.cursor() as cur:
-        with cur.copy(f"COPY {table_fqn} ({col_list}) FROM STDIN") as copy:
-            raw_count = _copy_rows(copy, stream, col_indices)
-    return raw_count, raw_count
+        written += 1
+    return raw_count, written
 
 
 def load_quarter(
@@ -487,14 +481,12 @@ def load_quarter(
     zip_path: Path,
     *,
     dry_run: bool = False,
-    use_staging: bool = False,
 ) -> dict[str, int]:
     """
-    Load one quarter's data.
+    Load one quarter's data via direct COPY with Python-side dedup.
 
-    Default mode copies directly into the constrained target tables for the
-    fastest fresh loads. Optional staging mode preserves idempotent reruns by
-    copying into a temp table first and merging with ON CONFLICT DO NOTHING.
+    Duplicates within the zip (FDA data has them) are detected by tracking
+    unique key tuples in a set and skipping repeats before they reach COPY.
 
     Returns {prefix: inserted_count}.
     """
@@ -515,48 +507,35 @@ def load_quarter(
         if missing:
             log.warning("[%s] %s: missing cols %s — will insert NULL.", label, prefix, missing)
 
+        # Resolve unique key positions within target_cols
+        uq_indices = [target_cols.index(c) for c in defn["unique_cols"]]
+
         tbl = defn["table"]
         table_fqn = f"{POSTGRES_SCHEMA}.{tbl}"
         col_list = ", ".join(target_cols)
 
         if dry_run:
-            raw_count = 0
-            for _ in stream:
-                raw_count += 1
+            raw_count = sum(1 for _ in stream)
             counts[prefix] = raw_count
             log.info("[%s] %s: %s rows (dry-run).", label, prefix, f"{raw_count:,}")
             continue
 
-        try:
-            if use_staging:
-                raw_count, inserted = _load_table_via_staging(
-                    conn, table_fqn, defn, col_list, col_indices, stream
-                )
-            else:
-                raw_count, inserted = _load_table_direct(
-                    conn, table_fqn, col_list, col_indices, stream
-                )
-        except psycopg.errors.UniqueViolation as exc:
-            conn.rollback()
-            if use_staging:
-                raise
-            raise RuntimeError(
-                f"[{label}] {prefix}: duplicate rows hit a UNIQUE constraint during direct COPY. "
-                "Retry with --stage for deduplicating loads."
-            ) from exc
+        # Pre-seed seen set with existing DB keys (handles cross-quarter dupes)
+        seen = _load_existing_keys(conn, table_fqn, defn["unique_cols"])
 
-        copy_elapsed = time.perf_counter() - t0
-
+        with conn.cursor() as cur:
+            with cur.copy(f"COPY {table_fqn} ({col_list}) FROM STDIN") as copy:
+                raw_count, written = _copy_rows_dedup(copy, stream, col_indices, uq_indices, seen)
         conn.commit()
-        elapsed = time.perf_counter() - t0
-        skipped = raw_count - inserted
 
-        counts[prefix] = inserted
+        elapsed = time.perf_counter() - t0
+        dupes = raw_count - written
+        counts[prefix] = written
         log.info(
-            "[%s] %s: %s raw → %s inserted, %s skipped (COPY %.1fs, total %.1fs)",
+            "[%s] %s: %s raw → %s inserted, %s dupes removed (%.1fs)",
             label, prefix,
-            f"{raw_count:,}", f"{inserted:,}", f"{skipped:,}",
-            copy_elapsed, elapsed,
+            f"{raw_count:,}", f"{written:,}", f"{dupes:,}",
+            elapsed,
         )
 
     quarter_elapsed = time.perf_counter() - quarter_t0
@@ -567,8 +546,6 @@ def load_quarter(
 def load(
     quarters: list[tuple[str, Path]],
     filter_labels: list[str] | None = None,
-    *,
-    use_staging: bool = False,
 ) -> None:
     if not POSTGRES_URI:
         raise RuntimeError("POSTGRES_URI not set in .env")
@@ -584,20 +561,15 @@ def load(
     with closing(psycopg.connect(POSTGRES_URI)) as conn:
         ensure_schema(conn)
         ensure_tables(conn)
-        # Staging mode needs unique constraint for ON CONFLICT — add before load.
-        # Direct mode benefits from no constraint during COPY — add after load.
-        if use_staging:
-            ensure_constraints(conn)
 
         total: dict[str, int] = {}
         for label, zip_path in quarters:
             log.info("── %s (%s) ──", label, zip_path.name)
-            counts = load_quarter(conn, label, zip_path, use_staging=use_staging)
+            counts = load_quarter(conn, label, zip_path)
             for k, v in counts.items():
                 total[k] = total.get(k, 0) + v
 
-        if not use_staging:
-            ensure_constraints(conn)
+        ensure_constraints(conn)
         ensure_indexes(conn)
 
     elapsed = time.perf_counter() - load_t0
@@ -613,11 +585,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="FAERS quarterly data explorer + loader")
     parser.add_argument("--explore", action="store_true", help="Print exploration summary")
     parser.add_argument("--load", action="store_true", help="Load data into PostgreSQL")
-    parser.add_argument(
-        "--stage",
-        action="store_true",
-        help="Use temp staging tables and ON CONFLICT deduping instead of direct COPY",
-    )
     parser.add_argument(
         "--quarters",
         nargs="+",
@@ -645,7 +612,7 @@ def main() -> None:
 
     if args.load:
         filter_labels = [q.upper() for q in args.quarters] if args.quarters else None
-        load(quarters, filter_labels=filter_labels, use_staging=args.stage)
+        load(quarters, filter_labels=filter_labels)
 
 
 if __name__ == "__main__":
