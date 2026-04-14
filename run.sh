@@ -17,9 +17,9 @@ echo ""
 echo "=== Step 3: Create training table (medlens schema) ==="
 uv run python data/training_data_builder.py --create-schema
 
-echo ""
-echo "=== Step 4: Index faers source tables (run once) ==="
-uv run python data/training_data_builder.py --create-faers-indexes
+# echo ""
+# echo "=== Step 4: Index faers source tables (run once) ==="
+# uv run python data/training_data_builder.py --create-faers-indexes
 
 echo ""
 echo "=== Step 5: Build training examples from FAERS ==="
