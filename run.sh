@@ -3,8 +3,8 @@
 # Skip steps you've already completed by commenting them out.
 set -euo pipefail
 
-echo "=== Step 1: Load pediatric FAERS (public schema) ==="
-uv run python data/pg_builder.py
+# echo "=== Step 1: Load pediatric FAERS (public schema) ==="
+# uv run python data/pg_builder.py
 
 echo ""
 echo "=== Step 2: Load raw FAERS quarterly data (faers schema) ==="
