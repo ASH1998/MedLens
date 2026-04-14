@@ -27,6 +27,7 @@ import zipfile
 from collections import Counter
 from contextlib import closing
 from pathlib import Path
+from typing import Iterator
 
 from dotenv import load_dotenv
 import psycopg
@@ -175,16 +176,20 @@ def iter_zip_file(zip_path: Path, prefix: str) -> tuple[list[str], list[list[str
             header = text.readline().rstrip("\n").split(SEP)
             rows = [line.rstrip("\n").split(SEP) for line in text if line.strip()]
     return header, rows
-
-
-def _find_zip_member(zip_path: Path, prefix: str) -> str | None:
-    """Find matching member name in zip for given table prefix."""
+def _iter_zip_lines(zip_path: Path, prefix: str) -> Iterator[str]:
+    """Yield raw lines from the matching member inside a FAERS zip."""
     with zipfile.ZipFile(zip_path) as zf:
-        return next(
+        target = next(
             (n for n in zf.namelist()
              if re.search(rf"/{prefix}\d{{2}}Q\d\.txt$", n, re.IGNORECASE)),
             None,
         )
+        if target is None:
+            return
+        with zf.open(target) as f:
+            text = io.TextIOWrapper(f, encoding="latin-1")
+            for line in text:
+                yield line.rstrip("\n")
 
 
 def _stream_zip_rows(zip_path: Path, prefix: str):
@@ -193,24 +198,14 @@ def _stream_zip_rows(zip_path: Path, prefix: str):
     Streams rows one at a time — no full list in memory.
     Keeps zip/file handles open for duration of iteration.
     """
-    target = _find_zip_member(zip_path, prefix)
-    if target is None:
+    lines = _iter_zip_lines(zip_path, prefix)
+    header_line = next(lines, None)
+    if header_line is None:
         return
-    zf = zipfile.ZipFile(zip_path)
-    try:
-        f = zf.open(target)
-        try:
-            text = io.TextIOWrapper(f, encoding="latin-1")
-            header = text.readline().rstrip("\n").split(SEP)
-            yield header
-            for line in text:
-                stripped = line.rstrip("\n")
-                if stripped.strip():
-                    yield stripped.split(SEP)
-        finally:
-            f.close()
-    finally:
-        zf.close()
+    yield header_line.split(SEP)
+    for stripped in lines:
+        if stripped.strip():
+            yield stripped.split(SEP)
 
 
 # ── exploration ────────────────────────────────────────────────────────────
@@ -314,53 +309,98 @@ def ensure_schema(conn) -> None:
 
 
 def ensure_tables(conn) -> None:
-    """Create tables + unique constraints if they don't exist. Idempotent."""
+    """Create tables if they don't exist (no constraints yet — added after load)."""
     with conn.cursor() as cur:
         for prefix, defn in TABLE_DEFS.items():
             tbl = defn["table"]
             table_fqn = f"{POSTGRES_SCHEMA}.{tbl}"
-            uq_name = _constraint_name(tbl)
-            uq_cols = defn["unique_cols"]
 
-            # Check if table exists
             cur.execute(
                 "SELECT 1 FROM information_schema.tables "
                 "WHERE table_schema = %s AND table_name = %s",
                 (POSTGRES_SCHEMA, tbl),
             )
-            table_exists = cur.fetchone() is not None
-
-            if not table_exists:
+            if cur.fetchone() is not None:
+                log.info("[%s] Table %s already exists.", prefix, table_fqn)
+            else:
                 col_defs = ",\n".join(
                     f"    {col} {dtype}" for col, dtype in defn["columns"].items()
                 )
-                uq_clause = f",\n    CONSTRAINT {uq_name} UNIQUE ({', '.join(uq_cols)})"
-                cur.execute(f"CREATE TABLE {table_fqn} (\n{col_defs}{uq_clause}\n);")
-                log.info("[%s] Created table %s with UNIQUE(%s).", prefix, table_fqn, ", ".join(uq_cols))
-            else:
-                # Table exists — check if unique constraint present
-                cur.execute(
-                    "SELECT 1 FROM information_schema.table_constraints "
-                    "WHERE table_schema = %s AND table_name = %s "
-                    "AND constraint_name = %s AND constraint_type = 'UNIQUE'",
-                    (POSTGRES_SCHEMA, tbl, uq_name),
-                )
-                has_uq = cur.fetchone() is not None
-                if has_uq:
-                    log.info("[%s] Table %s exists, UNIQUE(%s) already present — skip.", prefix, table_fqn, ", ".join(uq_cols))
-                else:
-                    # No unique constraint — drop and recreate with constraint.
-                    # Faster than deduping millions of rows; data will be reloaded.
-                    uq_col_list = ", ".join(uq_cols)
-                    col_defs = ",\n".join(
-                        f"    {col} {dtype}" for col, dtype in defn["columns"].items()
-                    )
-                    uq_clause = f",\n    CONSTRAINT {uq_name} UNIQUE ({uq_col_list})"
-                    cur.execute(f"DROP TABLE {table_fqn} CASCADE;")
-                    cur.execute(f"CREATE TABLE {table_fqn} (\n{col_defs}{uq_clause}\n);")
-                    log.info("[%s] Recreated %s with UNIQUE(%s) (old data had no constraint).", prefix, table_fqn, ", ".join(uq_cols))
+                cur.execute(f"CREATE TABLE {table_fqn} (\n{col_defs}\n);")
+                log.info("[%s] Created table %s.", prefix, table_fqn)
 
     conn.commit()
+
+
+def _dedup_table(cur, table_fqn: str, tbl: str, defn: dict, uq_cols: list[str]) -> int:
+    """Remove duplicate rows via DISTINCT ON + table swap. Returns rows removed."""
+    uq_col_list = ", ".join(uq_cols)
+    all_cols = ", ".join(defn["columns"].keys())
+    dedup_fqn = f"{POSTGRES_SCHEMA}._dedup_{tbl}"
+
+    cur.execute(f"SELECT count(*) FROM {table_fqn};")
+    before = cur.fetchone()[0]
+
+    cur.execute(
+        f"CREATE TABLE {dedup_fqn} AS "
+        f"SELECT DISTINCT ON ({uq_col_list}) {all_cols} "
+        f"FROM {table_fqn} ORDER BY {uq_col_list};"
+    )
+    cur.execute(f"DROP TABLE {table_fqn};")
+    cur.execute(f"ALTER TABLE {dedup_fqn} RENAME TO {tbl};")
+
+    cur.execute(f"SELECT count(*) FROM {table_fqn};")
+    after = cur.fetchone()[0]
+    return before - after
+
+
+def ensure_constraints(conn) -> None:
+    """Add unique constraints after data load. Dedup automatically if dupes found."""
+    t0 = time.perf_counter()
+    for prefix, defn in TABLE_DEFS.items():
+        tbl = defn["table"]
+        table_fqn = f"{POSTGRES_SCHEMA}.{tbl}"
+        uq_name = _constraint_name(tbl)
+        uq_cols = defn["unique_cols"]
+        uq_col_list = ", ".join(uq_cols)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM information_schema.table_constraints "
+                "WHERE table_schema = %s AND table_name = %s "
+                "AND constraint_name = %s AND constraint_type = 'UNIQUE'",
+                (POSTGRES_SCHEMA, tbl, uq_name),
+            )
+            if cur.fetchone() is not None:
+                log.info("[%s] UNIQUE(%s) already present — skip.", prefix, uq_col_list)
+                conn.commit()
+                continue
+
+            ct0 = time.perf_counter()
+            try:
+                cur.execute(
+                    f"ALTER TABLE {table_fqn} "
+                    f"ADD CONSTRAINT {uq_name} UNIQUE ({uq_col_list});"
+                )
+                conn.commit()
+                log.info("[%s] Added UNIQUE(%s) in %.1fs.", prefix, uq_col_list, time.perf_counter() - ct0)
+            except psycopg.errors.UniqueViolation:
+                conn.rollback()
+                log.warning("[%s] Duplicates found on (%s) — deduping...", prefix, uq_col_list)
+                dt0 = time.perf_counter()
+                with conn.cursor() as dcur:
+                    removed = _dedup_table(dcur, table_fqn, tbl, defn, uq_cols)
+                    dcur.execute(
+                        f"ALTER TABLE {table_fqn} "
+                        f"ADD CONSTRAINT {uq_name} UNIQUE ({uq_col_list});"
+                    )
+                conn.commit()
+                log.info(
+                    "[%s] Deduped %s removed, UNIQUE(%s) added in %.1fs.",
+                    prefix, f"{removed:,}", uq_col_list, time.perf_counter() - dt0,
+                )
+
+    log.info("All constraints ready in %.1fs.", time.perf_counter() - t0)
 
 
 def ensure_indexes(conn) -> None:
@@ -374,12 +414,88 @@ def ensure_indexes(conn) -> None:
     conn.commit()
 
 
-def load_quarter(conn, label: str, zip_path: Path, dry_run: bool = False) -> dict[str, int]:
+def _resolve_header_indices(header: list[str], target_cols: list[str]) -> tuple[list[int | None], list[str]]:
+    """Map target columns to source column positions."""
+    header_index = {name.lower(): idx for idx, name in enumerate(header)}
+    col_indices = []
+    missing = []
+
+    for col in target_cols:
+        idx = header_index.get(col.lower())
+        if idx is None:
+            missing.append(col)
+        col_indices.append(idx)
+
+    return col_indices, missing
+
+
+def _copy_rows(copy, stream, col_indices: list[int | None]) -> int:
+    """Copy streamed rows into PostgreSQL and return the number of source rows seen."""
+    raw_count = 0
+    for row in stream:
+        vals = []
+        for idx in col_indices:
+            if idx is None or idx >= len(row):
+                vals.append(None)
+            else:
+                value = row[idx].strip()
+                vals.append(value if value else None)
+        copy.write_row(vals)
+        raw_count += 1
+    return raw_count
+
+
+def _load_table_via_staging(conn, table_fqn: str, defn: dict, col_list: str, col_indices: list[int | None], stream) -> tuple[int, int]:
+    """COPY into a temp staging table, then merge into the constrained target table."""
+    target_cols = list(defn["columns"].keys())
+    uq_cols = defn["unique_cols"]
+    temp_table = f"_staging_{defn['table']}"
+    raw_count = 0
+
+    with conn.cursor() as cur:
+        col_defs = ",\n".join(
+            f"    {col} {dtype}" for col, dtype in defn["columns"].items()
+        )
+        cur.execute(f"CREATE TEMP TABLE {temp_table} (\n{col_defs}\n) ON COMMIT DROP;")
+
+        with cur.copy(f"COPY {temp_table} ({col_list}) FROM STDIN") as copy:
+            raw_count = _copy_rows(copy, stream, col_indices)
+
+        conflict_cols = ", ".join(uq_cols)
+        select_cols = ", ".join(target_cols)
+        cur.execute(
+            f"INSERT INTO {table_fqn} ({col_list}) "
+            f"SELECT {select_cols} FROM {temp_table} "
+            f"ON CONFLICT ({conflict_cols}) DO NOTHING;"
+        )
+        inserted = cur.rowcount
+
+    return raw_count, inserted
+
+
+def _load_table_direct(conn, table_fqn: str, col_list: str, col_indices: list[int | None], stream) -> tuple[int, int]:
+    """COPY directly into the constrained target table."""
+    with conn.cursor() as cur:
+        with cur.copy(f"COPY {table_fqn} ({col_list}) FROM STDIN") as copy:
+            raw_count = _copy_rows(copy, stream, col_indices)
+    return raw_count, raw_count
+
+
+def load_quarter(
+    conn,
+    label: str,
+    zip_path: Path,
+    *,
+    dry_run: bool = False,
+    use_staging: bool = False,
+) -> dict[str, int]:
     """
-    Load one quarter's data via staging table approach:
-      1. COPY raw rows → temp staging table (no constraints, max speed)
-      2. INSERT INTO real table ... ON CONFLICT DO NOTHING (dedup)
-      3. DROP staging table
+    Load one quarter's data.
+
+    Default mode copies directly into the constrained target tables for the
+    fastest fresh loads. Optional staging mode preserves idempotent reruns by
+    copying into a temp table first and merging with ON CONFLICT DO NOTHING.
+
     Returns {prefix: inserted_count}.
     """
     counts = {}
@@ -394,67 +510,42 @@ def load_quarter(conn, label: str, zip_path: Path, dry_run: bool = False) -> dic
             continue
 
         target_cols = list(defn["columns"].keys())
-        header_lower = [h.lower() for h in header]
-        col_indices = []
-        missing = []
-        for col in target_cols:
-            try:
-                col_indices.append(header_lower.index(col.lower()))
-            except ValueError:
-                missing.append(col)
-                col_indices.append(None)
+        col_indices, missing = _resolve_header_indices(header, target_cols)
 
         if missing:
             log.warning("[%s] %s: missing cols %s — will insert NULL.", label, prefix, missing)
 
         tbl = defn["table"]
         table_fqn = f"{POSTGRES_SCHEMA}.{tbl}"
-        staging_fqn = f"{POSTGRES_SCHEMA}._staging_{tbl}"
-        uq_cols = defn["unique_cols"]
         col_list = ", ".join(target_cols)
-        raw_count = 0
 
         if dry_run:
+            raw_count = 0
             for _ in stream:
                 raw_count += 1
             counts[prefix] = raw_count
             log.info("[%s] %s: %s rows (dry-run).", label, prefix, f"{raw_count:,}")
             continue
 
-        with conn.cursor() as cur:
-            # 1. Create temp staging table (same columns, no constraints)
-            col_defs = ",\n".join(
-                f"    {col} {dtype}" for col, dtype in defn["columns"].items()
-            )
-            cur.execute(f"DROP TABLE IF EXISTS {staging_fqn};")
-            cur.execute(f"CREATE UNLOGGED TABLE {staging_fqn} (\n{col_defs}\n);")
+        try:
+            if use_staging:
+                raw_count, inserted = _load_table_via_staging(
+                    conn, table_fqn, defn, col_list, col_indices, stream
+                )
+            else:
+                raw_count, inserted = _load_table_direct(
+                    conn, table_fqn, col_list, col_indices, stream
+                )
+        except psycopg.errors.UniqueViolation as exc:
+            conn.rollback()
+            if use_staging:
+                raise
+            raise RuntimeError(
+                f"[{label}] {prefix}: duplicate rows hit a UNIQUE constraint during direct COPY. "
+                "Retry with --stage for deduplicating loads."
+            ) from exc
 
-            # 2. COPY raw data into staging — fast, no constraint checks
-            with cur.copy(f"COPY {staging_fqn} ({col_list}) FROM STDIN") as copy:
-                for row in stream:
-                    vals = []
-                    for idx in col_indices:
-                        if idx is None or idx >= len(row):
-                            vals.append(None)
-                        else:
-                            v = row[idx].strip()
-                            vals.append(v if v else None)
-                    copy.write_row(vals)
-                    raw_count += 1
-
-            copy_elapsed = time.perf_counter() - t0
-
-            # 3. INSERT from staging → real table, skip duplicates
-            conflict_cols = ", ".join(uq_cols)
-            cur.execute(
-                f"INSERT INTO {table_fqn} ({col_list}) "
-                f"SELECT {col_list} FROM {staging_fqn} "
-                f"ON CONFLICT ({conflict_cols}) DO NOTHING;"
-            )
-            inserted = cur.rowcount
-
-            # 4. Cleanup staging
-            cur.execute(f"DROP TABLE {staging_fqn};")
+        copy_elapsed = time.perf_counter() - t0
 
         conn.commit()
         elapsed = time.perf_counter() - t0
@@ -473,7 +564,12 @@ def load_quarter(conn, label: str, zip_path: Path, dry_run: bool = False) -> dic
     return counts
 
 
-def load(quarters: list[tuple[str, Path]], filter_labels: list[str] | None = None) -> None:
+def load(
+    quarters: list[tuple[str, Path]],
+    filter_labels: list[str] | None = None,
+    *,
+    use_staging: bool = False,
+) -> None:
     if not POSTGRES_URI:
         raise RuntimeError("POSTGRES_URI not set in .env")
 
@@ -488,14 +584,20 @@ def load(quarters: list[tuple[str, Path]], filter_labels: list[str] | None = Non
     with closing(psycopg.connect(POSTGRES_URI)) as conn:
         ensure_schema(conn)
         ensure_tables(conn)
+        # Staging mode needs unique constraint for ON CONFLICT — add before load.
+        # Direct mode benefits from no constraint during COPY — add after load.
+        if use_staging:
+            ensure_constraints(conn)
 
         total: dict[str, int] = {}
         for label, zip_path in quarters:
             log.info("── %s (%s) ──", label, zip_path.name)
-            counts = load_quarter(conn, label, zip_path)
+            counts = load_quarter(conn, label, zip_path, use_staging=use_staging)
             for k, v in counts.items():
                 total[k] = total.get(k, 0) + v
 
+        if not use_staging:
+            ensure_constraints(conn)
         ensure_indexes(conn)
 
     elapsed = time.perf_counter() - load_t0
@@ -511,6 +613,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="FAERS quarterly data explorer + loader")
     parser.add_argument("--explore", action="store_true", help="Print exploration summary")
     parser.add_argument("--load", action="store_true", help="Load data into PostgreSQL")
+    parser.add_argument(
+        "--stage",
+        action="store_true",
+        help="Use temp staging tables and ON CONFLICT deduping instead of direct COPY",
+    )
     parser.add_argument(
         "--quarters",
         nargs="+",
@@ -538,7 +645,7 @@ def main() -> None:
 
     if args.load:
         filter_labels = [q.upper() for q in args.quarters] if args.quarters else None
-        load(quarters, filter_labels=filter_labels)
+        load(quarters, filter_labels=filter_labels, use_staging=args.stage)
 
 
 if __name__ == "__main__":
