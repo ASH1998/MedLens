@@ -10,7 +10,7 @@ Usage:
     uv run python data/training_data_builder.py --create-faers-indexes # (run once to add indexes on FAERS source tables; speeds up multi-drug query by ~10x)
 
     # (2) Populate from FAERS (multi-drug suspect cases → Type B examples)
-    uv run python data/training_data_builder.py --build-faers --limit 5000
+    uv run python data/training_data_builder.py --build-faers --limit 5000 --thinking-mode never
     uv run python data/training_data_builder.py --build-faers --min-drugs 3 --max-drugs 8
 
     # (3) Inspect what was loaded
@@ -25,6 +25,7 @@ DrugBank / synthetic / agentic example generators are stubbed — plug in later.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -69,6 +70,21 @@ OUTC_TO_SEVERITY = {
     "OT": "Minor",
 }
 SEVERITY_RANK = {"Major": 3, "Moderate": 2, "Minor": 1, "None": 0}
+DEFAULT_THINKING_MODE = "never"
+PROMPT_VARIANTS = ("narrative", "review_request", "symptom_first", "medication_check")
+ANSWER_VARIANTS = ("structured", "concise", "clinical_note", "risk_screen")
+ACTION_BY_SEVERITY = {
+    "Major": "Urgent medication review is warranted.",
+    "Moderate": "Prompt medication review is warranted.",
+    "Minor": "Medication review is reasonable, especially if symptoms continue.",
+    "None": "No strong interaction signal is evident from this case alone.",
+}
+HEADLINE_BY_SEVERITY = {
+    "Major": "MAJOR interaction risk.",
+    "Moderate": "MODERATE interaction risk.",
+    "Minor": "MINOR interaction risk.",
+    "None": "No strong interaction signal.",
+}
 
 # ── DDL ──────────────────────────────────────────────────────────────────
 
@@ -246,15 +262,24 @@ def format_age(age: str | None, age_cod: str | None) -> str | None:
     return f"{age} {unit}".strip() if unit else age
 
 
-def render_messages_type_b(
-    drugs: list[str],
-    reactions: list[str],
-    indications: list[str] | None,
-    severity: str,
-    age: str | None,
-    sex: str | None,
-) -> tuple[list[dict], str]:
-    """Build Unsloth-format messages + think_trace for one Type B example."""
+def _stable_index(seed: str, modulo: int) -> int:
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % modulo
+
+
+def _stable_pick(seed: str, options: tuple[str, ...]) -> str:
+    return options[_stable_index(seed, len(options))]
+
+
+def _include_think(seed: str, thinking_mode: str) -> bool:
+    if thinking_mode == "always":
+        return True
+    if thinking_mode == "never":
+        return False
+    return _stable_index(seed + ":think", 100) < 25
+
+
+def _build_patient_strings(age: str | None, sex: str | None) -> tuple[str, str, str]:
     sex_map = {"M": "male", "F": "female"}
     sex_str = sex_map.get((sex or "").upper(), "")
 
@@ -265,49 +290,173 @@ def render_messages_type_b(
         patient_parts.append(sex_str)
     patient_desc = " ".join(patient_parts) if patient_parts else "a patient"
 
-    ind_str = (
-        f" I take them for {', '.join(indications[:3])}."
-        if indications else ""
-    )
-    user_msg = (
-        f"I'm {patient_desc}. I currently take: "
-        f"{', '.join(drugs)}.{ind_str} "
-        f"I've been experiencing: {', '.join(reactions[:5])}. "
-        f"Are any of these drugs interacting?"
-    )
-
-    n = len(drugs)
-    n_pairs = n * (n - 1) // 2
-
     demo_bits = []
     if age:
         demo_bits.append(f"age: {age}")
     if sex_str:
         demo_bits.append(f"sex: {sex_str}")
     demo_str = f" ({', '.join(demo_bits)})" if demo_bits else ""
+    return sex_str, patient_desc, demo_str
 
-    think = (
-        f"Patient{demo_str} on {n} concurrent drugs: {', '.join(drugs)}. "
-        f"{n_pairs} possible pairwise interactions to evaluate. "
-        f"Reported adverse events: {', '.join(reactions[:5])}. "
-        f"Demographics are relevant — elderly and pediatric patients have "
-        f"altered pharmacokinetics, and sex-based differences affect CYP450 "
-        f"metabolism. "
-        f"This pattern matches FAERS-documented multi-drug cases with "
-        f"severity classification: {severity}. "
-        f"Systematic pair check needed before giving advice."
+
+def _render_user_message(
+    drugs: list[str],
+    reactions: list[str],
+    indications: list[str] | None,
+    patient_desc: str,
+    variant: str,
+) -> str:
+    drug_text = ", ".join(drugs)
+    reaction_text = ", ".join(reactions[:5])
+    indication_text = ", ".join(indications[:3]) if indications else ""
+
+    if variant == "review_request":
+        parts = ["Review this medication regimen for interaction risk."]
+        if patient_desc != "a patient":
+            parts.append(f"Patient: {patient_desc}.")
+        parts.append(f"Medications: {drug_text}.")
+        if indication_text:
+            parts.append(f"Indications: {indication_text}.")
+        parts.append(f"Symptoms: {reaction_text}.")
+        parts.append("Give the likely interaction severity and why it stands out.")
+        return " ".join(parts)
+
+    if variant == "symptom_first":
+        parts = [f"I have been dealing with {reaction_text}."]
+        if patient_desc != "a patient":
+            parts.append(f"I am {patient_desc}.")
+        parts.append(f"My medications are {drug_text}.")
+        if indication_text:
+            parts.append(f"I take them for {indication_text}.")
+        parts.append("Which interaction pattern is most concerning here?")
+        return " ".join(parts)
+
+    if variant == "medication_check":
+        lines = ["Medication interaction check"]
+        if patient_desc != "a patient":
+            lines.append(f"Patient: {patient_desc}")
+        lines.append(f"Current drugs: {drug_text}")
+        if indication_text:
+            lines.append(f"Indications: {indication_text}")
+        lines.append(f"Reported symptoms: {reaction_text}")
+        lines.append("Question: Is this regimen high risk for a drug interaction?")
+        return "\n".join(lines)
+
+    ind_str = f" I take them for {indication_text}." if indication_text else ""
+    return (
+        f"I'm {patient_desc}. I currently take: "
+        f"{drug_text}.{ind_str} "
+        f"I've been experiencing: {reaction_text}. "
+        f"Are any of these drugs interacting?"
     )
 
-    icon = {"Major": "🚨", "Moderate": "⚠️", "Minor": "ℹ️", "None": "✅"}[severity]
-    assistant_msg = (
-        f"<|think|>{think}</think>\n\n"
-        f"{icon} **{severity.upper()} interaction risk detected**\n\n"
-        f"**Medications reviewed ({n}):** {', '.join(drugs)}\n\n"
-        f"**Reported adverse events:** {', '.join(reactions[:5])}\n\n"
-        f"Based on real-world pharmacovigilance data, this combination "
-        f"has been associated with {severity.lower()} outcomes. "
-        f"Please consult your prescribing physician or pharmacist before "
-        f"making any changes — do not stop medications abruptly."
+
+def _build_think_trace(
+    drugs: list[str],
+    reactions: list[str],
+    severity: str,
+    demo_str: str,
+) -> str:
+    return (
+        f"Assess regimen-level interaction risk{demo_str}. "
+        f"Drugs: {', '.join(drugs)}. "
+        f"Reported events: {', '.join(reactions[:5])}. "
+        f"FAERS severity bucket: {severity}. "
+        f"Answer directly, avoid boilerplate, and keep the output concrete."
+    )
+
+
+def _render_assistant_message(
+    drugs: list[str],
+    reactions: list[str],
+    severity: str,
+    n_pairs: int,
+    variant: str,
+    think: str | None,
+) -> str:
+    drug_text = ", ".join(drugs)
+    reaction_text = ", ".join(reactions[:5])
+    severity_lower = severity.lower()
+    headline = HEADLINE_BY_SEVERITY[severity]
+    action = ACTION_BY_SEVERITY[severity]
+
+    if severity == "None":
+        evidence_line = "This case does not show a strong interaction signal from FAERS alone."
+    else:
+        evidence_line = (
+            f"This regimen matches a {severity_lower} multi-drug adverse-event signal in FAERS."
+        )
+
+    limitation_line = (
+        f"FAERS supports the regimen-level signal across {n_pairs} possible drug pairs, "
+        f"but it does not isolate one confirmed causal pair."
+    )
+
+    if variant == "concise":
+        body = (
+            f"{headline} {evidence_line} Reported events: {reaction_text}. "
+            f"Regimen reviewed: {drug_text}. {limitation_line} {action}"
+        )
+    elif variant == "clinical_note":
+        body = (
+            f"Impression: {headline}\n"
+            f"Key findings: {reaction_text} while taking {drug_text}.\n"
+            f"Evidence basis: {evidence_line}\n"
+            f"Interpretation: {limitation_line}\n"
+            f"Priority: {action}"
+        )
+    elif variant == "risk_screen":
+        body = (
+            f"Overall risk: {severity}\n"
+            f"- Regimen reviewed: {drug_text}\n"
+            f"- Reported events: {reaction_text}\n"
+            f"- Signal: {evidence_line}\n"
+            f"- Limitation: {limitation_line}\n"
+            f"- Priority: {action}"
+        )
+    else:
+        body = (
+            f"{headline}\n\n"
+            f"Medications reviewed: {drug_text}\n"
+            f"Reported events: {reaction_text}\n"
+            f"Interpretation: {evidence_line}\n"
+            f"Confidence note: {limitation_line}\n"
+            f"Priority: {action}"
+        )
+
+    if think:
+        return f"<|think|>{think}</think>\n\n{body}"
+    return body
+
+
+def render_messages_type_b(
+    source_ref: str,
+    drugs: list[str],
+    reactions: list[str],
+    indications: list[str] | None,
+    severity: str,
+    age: str | None,
+    sex: str | None,
+    thinking_mode: str = DEFAULT_THINKING_MODE,
+) -> tuple[list[dict], str]:
+    """Build varied Unsloth-format messages with optional think traces."""
+    n = len(drugs)
+    n_pairs = n * (n - 1) // 2
+    seed = f"{source_ref}:{'|'.join(drugs)}:{severity}:{n}"
+    _, patient_desc, demo_str = _build_patient_strings(age, sex)
+    prompt_variant = _stable_pick(seed + ":prompt", PROMPT_VARIANTS)
+    answer_variant = _stable_pick(seed + ":answer", ANSWER_VARIANTS)
+    include_think = _include_think(seed, thinking_mode)
+
+    user_msg = _render_user_message(drugs, reactions, indications, patient_desc, prompt_variant)
+    think = _build_think_trace(drugs, reactions, severity, demo_str) if include_think else ""
+    assistant_msg = _render_assistant_message(
+        drugs,
+        reactions,
+        severity,
+        n_pairs,
+        answer_variant,
+        think if include_think else None,
     )
 
     messages = [
@@ -339,7 +488,7 @@ INSERT INTO {SCHEMA}.{TABLE} (
 
 
 def _row_to_record(
-    row: tuple, min_drugs: int
+    row: tuple, min_drugs: int, thinking_mode: str
 ) -> tuple | None:
     """Convert one FAERS result row → INSERT tuple, or None if filtered out."""
     primaryid, drugs, reactions, indications, outcome_codes, age, age_cod, sex = row
@@ -352,16 +501,17 @@ def _row_to_record(
     severity = severity_from_outcomes(outcome_codes)
     age_str = format_age(age, age_cod)
     messages, think = render_messages_type_b(
-        drugs, reactions, indications, severity, age_str, sex,
+        str(primaryid), drugs, reactions, indications, severity, age_str, sex, thinking_mode,
     )
     tok_total = count_message_tokens(messages)
-    tok_think = count_tokens(think)
+    has_think = bool(think)
+    tok_think = count_tokens(think) if has_think else None
     return (
         "multi_drug", "faers", str(primaryid),
         Json(drugs), len(drugs), Json(pairs), len(pairs),
         Json(reactions), Json(indications or []), Json(outcome_codes or []), severity,
         age_str, sex,
-        Json(messages), len(messages), True, think,
+        Json(messages), len(messages), has_think, think or None,
         tok_total, tok_think,
         "train",
     )
@@ -370,7 +520,13 @@ def _row_to_record(
 STREAM_THRESHOLD = 20_000  # above this, use ServerCursor + chunks; below, single-shot
 
 
-def build_from_faers(limit: int, min_drugs: int, max_drugs: int, batch_size: int = CHUNK_SIZE) -> int:
+def build_from_faers(
+    limit: int,
+    min_drugs: int,
+    max_drugs: int,
+    batch_size: int = CHUNK_SIZE,
+    thinking_mode: str = DEFAULT_THINKING_MODE,
+) -> int:
     """
     Two modes:
       • limit <= STREAM_THRESHOLD: client cursor + single executemany
@@ -395,7 +551,7 @@ def build_from_faers(limit: int, min_drugs: int, max_drugs: int, batch_size: int
 
             records = []
             for row in rows:
-                rec = _row_to_record(row, min_drugs)
+                rec = _row_to_record(row, min_drugs, thinking_mode)
                 if rec is None:
                     skipped += 1
                 else:
@@ -434,7 +590,7 @@ def build_from_faers(limit: int, min_drugs: int, max_drugs: int, batch_size: int
                 {"limit": limit, "min_drugs": min_drugs, "max_drugs": max_drugs},
             )
             for row in reader:
-                record = _row_to_record(row, min_drugs)
+                record = _row_to_record(row, min_drugs, thinking_mode)
                 if record is None:
                     skipped += 1
                     continue
@@ -488,6 +644,17 @@ def stats() -> None:
             print("\nBy split:")
             for s, c in cur.fetchall():
                 print(f"  {s:8s}: {c:>8,}")
+
+            cur.execute(f"""
+                SELECT has_think, COUNT(*)
+                FROM {SCHEMA}.{TABLE}
+                GROUP BY has_think
+                ORDER BY has_think DESC;
+            """)
+            print("\nBy think usage:")
+            for has_think, c in cur.fetchall():
+                label = "with_think" if has_think else "no_think"
+                print(f"  {label:10s}: {c:>8,}")
 
             cur.execute(f"""
                 SELECT
@@ -545,6 +712,9 @@ def main() -> None:
                    help="Max FAERS cases to pull (default: 5000)")
     p.add_argument("--min-drugs", type=int, default=3)
     p.add_argument("--max-drugs", type=int, default=8)
+    p.add_argument("--thinking-mode", choices=["never", "mixed", "always"],
+                   default=DEFAULT_THINKING_MODE,
+                   help="Whether assistant labels include <|think|> blocks")
     p.add_argument("--batch-size", type=int, default=CHUNK_SIZE,
                    help=f"Rows per insert batch (default: {CHUNK_SIZE})")
     p.add_argument("--stats", action="store_true")
@@ -565,7 +735,13 @@ def main() -> None:
         did_something = True
 
     if args.build_faers:
-        build_from_faers(args.limit, args.min_drugs, args.max_drugs, args.batch_size)
+        build_from_faers(
+            args.limit,
+            args.min_drugs,
+            args.max_drugs,
+            args.batch_size,
+            args.thinking_mode,
+        )
         did_something = True
 
     if args.stats:

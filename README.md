@@ -84,10 +84,13 @@ One table: `medlens.training_examples`.
 uv run python data/training_data_builder.py --create-schema
 
 # Populate from FAERS multi-drug suspect cases (Type B examples)
-uv run python data/training_data_builder.py --build-faers --limit 5000
+uv run python data/training_data_builder.py --build-faers --limit 5000 --thinking-mode never
 
 # Control drug count per example (default: 3–8 drugs)
 uv run python data/training_data_builder.py --build-faers --min-drugs 2 --max-drugs 6 --limit 10000
+
+# Mix direct answers with a smaller number of think-tagged examples
+uv run python data/training_data_builder.py --build-faers --limit 10000 --thinking-mode mixed
 
 # Check what was loaded
 uv run python data/training_data_builder.py --stats
@@ -107,8 +110,10 @@ uv run python data/training_data_builder.py --export data/medlens_train.jsonl --
 
 Output format (Unsloth-compatible):
 ```json
-{"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "<|think|>...</think>\n\n..."}]}
+{"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
+
+If `--thinking-mode mixed` or `--thinking-mode always` is used, assistant labels may include an optional `<|think|>...</think>` prefix.
 
 ---
 
