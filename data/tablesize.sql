@@ -10,3 +10,8 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind = 'r'
   AND n.nspname IN ('faers', 'medlens')
 ORDER BY n.nspname, pg_total_relation_size(c.oid) DESC;
+
+
+
+-- truncate tables before re-running data builder to avoid duplicates during development
+TRUNCATE faers.demo, faers.drug, faers.indi, faers.outc, faers.reac, faers.ther;
