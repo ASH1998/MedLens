@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **MedLens** is an on-device polypharmacy drug interaction detection agent built for the **Gemma 4 Good Hackathon** (deadline: May 18, 2026, up to $80K across 4 tracks).
 
-**The mission:** An Android app that photographs medication bottles, extracts drug info via OCR + vision, reasons about multi-drug interaction risks using a fine-tuned Gemma 4 E2B model, and generates severity-ranked safety reports — 100% offline, on-device, privacy-preserving.
+**The mission:** An Android app that photographs medication bottles, extracts drug info via OCR + vision, reasons about multi-drug interaction risks, and generates severity-ranked safety reports — 100% offline, on-device, privacy-preserving.
+
+**Current architecture (pivoted from fine-tuning):** **Agent + Local Retrieval + ML Classifier**, with **base (non-fine-tuned) Gemma 4 E2B** as the on-device reasoning head via LiteRT-LM. A lightweight severity classifier trained on the FAERS-derived `medlens.training_examples` table (~943K rows) and a local pair/regimen retrieval index do the heavy lifting; the LLM only explains and drives the agent loop. See `new_plan.md` for the full revised plan. The earlier Unsloth LoRA fine-tune plan in `medlens-plan.md` is deprecated — keep it for historical context only.
 
 **Target tracks:** LiteRT ($10K) + Unsloth ($10K) + Health & Sciences ($10K) + Main Track ($10K–$50K)
 
@@ -47,9 +49,9 @@ The PostgreSQL MCP server is available in Claude Code sessions, allowing direct 
 
 ## Architecture: 5-Phase Plan
 
-See `medlens-plan.md` for the detailed implementation plan. High-level:
+**See `new_plan.md` for the current plan.** `medlens-plan.md` below is the deprecated fine-tuning plan kept for historical reference.
 
-### Phase 1: Data & Fine-Tuning Dataset (current)
+### Phase 1: Data & Training Dataset (current)
 
 **Source 1 — Pediatric FAERS (preprocessed):**
 - `data/raw/effect_peds_19q2_v0.3_20211119.sql.gz` — 263MB compressed SQL dump (SQLite format)
@@ -71,19 +73,21 @@ See `medlens-plan.md` for the detailed implementation plan. High-level:
 - DrugBank 6.0 (1.4M interactions) — still the primary pairwise DDI knowledge base
 - OpenFDA Drug Labels, RxNorm (brand→generic where `prod_ai` is missing)
 
-**Output target:** ~7,000 instruction-tuning examples in Unsloth chat format + `interaction_db.json` (top 200 drugs, ~5MB) for on-device lookup
+**Output target (current):** The data pipeline has already produced `medlens.training_examples` (~943K rows, all `multi_drug` from FAERS; severity Major/Minor/Moderate/None = 470.8K/393.9K/22.3K/56.1K; `n_drugs` 3–8). This table now feeds (a) the ML severity classifier and (b) the retrieval indexes. Still produce `interaction_db.json` (top 200 drugs, ~5 MB) for on-device lookup.
+
+**Schema of `medlens.training_examples`:** `id`, `example_type`, `source`, `source_ref`, `drugs` (jsonb), `n_drugs`, `pairs` (jsonb, all C(n,2)), `n_pairs`, `reactions` (jsonb), `indications` (jsonb), `outcome_codes` (jsonb), `severity`, `mechanisms` (jsonb), `age`, `sex`, `messages` (jsonb user/assistant pair), `n_turns`, `has_think` (all false), `think_trace`, `token_count`, `thinking_token_count`, `quality_score`, `split` (all `train` — needs stratified val/test), `created_at`. GIN indexes on `drugs`, `pairs`, `reactions`.
 
 **Training signal in raw FAERS (per quarter):**
 - ~73K multi-drug suspect cases (≥2 drugs with PS/SS/I role)
 - ~36K of those with severe outcomes (DE/LT/HO) — classic Type B training examples
 - ~10K cases with FDA-coded `role_cod='I'` (explicit DDI flags)
 
-### Phase 2: Fine-Tuning with Unsloth
-- Model: Gemma 4 E2B with LoRA on Google Colab (T4 GPU)
-- 3 training example types: single interaction query, multi-drug analysis, agentic follow-up
-- The `<|think|>` tag is used for chain-of-thought reasoning in training examples
-- Evaluation benchmark: DDI Corpus (792 DrugBank texts, 5,028 annotated DDIs) — evaluation only, not training
-- Export chain: safetensors → GGUF → LiteRT `.task` format → Hugging Face
+### Phase 2: ML Severity Classifier + Retrieval Indexes (replaces fine-tuning)
+- **Classifier** trained on `medlens.training_examples` to predict regimen-level severity ∈ {Major, Moderate, Minor, None} and top-k risky pairs. Baseline: LightGBM on sparse ingredient multi-hot + pair empirical priors + demographics; second pass: small MLP exported to LiteRT `.tflite` (<10 MB, <50 ms on mid-tier Android).
+- **Pair KV store** (SQLite) — exploded from `pairs` with joined severity/outcomes; on-device lookup.
+- **Regimen vector index** — fixed-dim embedding of ingredient sets for ~100K most-frequent regimens, stored via `sqlite-vss` / `usearch` on device.
+- **Base Gemma 4 E2B** is used without weight updates via LiteRT-LM. `<|think|>` reasoning is elicited at inference time via prompting, not trained in (`has_think=false` in all rows).
+- Evaluation benchmark: DDI Corpus (792 DrugBank texts, 5,028 annotated DDIs) — now measured on the classifier + retrieval pipeline.
 
 ### Phase 3: Android App (LiteRT-LM)
 Kotlin app with 4 screens: Camera → Medication List → Interaction Report → Chat.
@@ -92,14 +96,18 @@ Kotlin app with 4 screens: Camera → Medication List → Interaction Report →
 ```
 UI (Jetpack Compose)
     ↓
-Agent/Reasoning (ConversationManager + ToolSet)
+Agent/Reasoning (base Gemma 4 E2B via LiteRT-LM + ToolSet)
     ↓
-Tool Layer: extractMedication(image) | checkInteractions(drugs) | getContraindications(drug) | generateReport(interactions)
+Tool Layer: extractMedication(image) | lookupPair(a,b) | retrieveSimilarRegimen(drugs[]) |
+            classifyRegimen(drugs[], age?, sex?) | generateReport(findings[])
     ↓
-Data Layer: InteractionDB (local JSON) | RxNormMapping | Room DB (history)
+Data Layer: Pair KV (SQLite) | Regimen Vector Index (sqlite-vss/usearch) |
+            InteractionDB top-200 (JSON) | RxNorm map | Room DB (history)
     ↓
-ML Layer: LiteRT-LM (Gemma 4 E2B .task file) | ML Kit Text Recognition (OCR)
+ML Layer: LiteRT-LM (Gemma 4 E2B .task, no FT) | Severity Classifier (.tflite) |
+          ML Kit Text Recognition (OCR)
 ```
+The classifier + retrieval are authoritative for severity; the LLM narrates and drives the agent loop but does not invent findings.
 
 ### Phase 4: Agentic Loop & Polish
 - Native function calling with Gemma 4's ToolSet pattern
@@ -128,6 +136,7 @@ Evaluation: Impact (40%), Demo Video (30%), Technical Depth (30%). The video is 
 |--------|--------------|----------|
 | `public` | `pg_builder.py` | Pediatric FAERS processed (ade_raw, ade_nichd) + SIDER + DrugBank pharmacogenomics — 17 tables, ~1.1GB |
 | `faers` | `faers_explorer.py --load` | Raw FAERS quarterly dumps — 6 tables keyed on `primaryid` (case ID) |
+| `medlens` | data rebuild notebooks (`data/finetune/`) | `training_examples` — 943K rows feeding the classifier + retrieval; see schema above |
 | `raw_data` | `pg_builder.py` (intent) | Empty in practice — `pg_builder.py` intends to move tables here but they remain in `public` |
 
 ## Data Files
