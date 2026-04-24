@@ -431,7 +431,118 @@ This deterministic synthesis replaces the learned severity head.
 
 ---
 
-## 12. Evaluation Plan
+## 12. MVP Safety Boundary and Common-Drug Dataset
+
+The MVP should be framed as:
+
+> MedLens identifies medicines from images, normalizes them to active ingredients, and checks a local evidence database for known and reported safety risks.
+
+The system should not claim complete coverage. The local evidence and deterministic tool layer are the authority for safety findings. Gemma may explain, ask follow-up questions, and help users understand verified results, but it must not invent adverse effects or interactions from model memory.
+
+### 12.1 End-to-end MVP flow
+
+1. Scan medicine image or accept typed/uploaded medication text.
+2. Extract candidate medicine names with OCR/VLM.
+3. Normalize candidates to active ingredients.
+4. Ask the user to review/edit the detected medication list.
+5. Check local evidence:
+   - known curated interactions,
+   - FAERS-derived pair evidence,
+   - regimen evidence when available,
+   - known/common adverse effects.
+6. Build a deterministic structured report.
+7. Let Gemma generate user-friendly explanation from the structured report only.
+
+Manual user confirmation is part of the safety design. Image recognition does not need to be perfect for the MVP; the user must be able to correct OCR and normalization mistakes before the safety report is generated.
+
+### 12.2 Fallback policy
+
+If a scanned or typed drug is not in the local database:
+
+- Offline mode: mark it as unresolved or unsupported and say interactions cannot be verified locally.
+- Online mode: use trusted sources only to identify the active ingredient or label information, then run the same local evidence checks if normalization succeeds.
+- LLM fallback may be used for general educational language, but not as the authority for verified interaction or severity claims.
+
+Acceptable fallback:
+- “I found this medicine name, but it is not in the local safety database.”
+- “I can identify the likely active ingredient, but I do not have local interaction evidence for it.”
+- “This is general information, not a verified MedLens safety finding.”
+
+Unsafe fallback:
+- Asking the LLM to invent interactions or adverse effects from memory and presenting them as verified findings.
+- Assigning a severity level without local evidence or deterministic rules.
+
+### 12.3 Evidence bundle strategy
+
+Build two practical evidence bundles instead of trying to cover every possible medicine immediately.
+
+#### A. Common-Med Bundle
+
+Target 100-300 common ingredients across US, India, and Europe-like outpatient use. This bundle should prioritize medications people commonly keep at home or take chronically:
+
+- Pain/fever: acetaminophen/paracetamol, ibuprofen, aspirin, naproxen, diclofenac.
+- Diabetes: metformin, glimepiride, insulin, sitagliptin.
+- Blood pressure/heart: amlodipine, losartan, telmisartan, lisinopril, ramipril, metoprolol, carvedilol, furosemide.
+- Cholesterol: atorvastatin, rosuvastatin, simvastatin.
+- Stomach/acid: pantoprazole, omeprazole, esomeprazole, lansoprazole.
+- Antibiotics: amoxicillin, amoxicillin/clavulanate, azithromycin, ciprofloxacin, cefixime, cephalexin.
+- Psych/neuro: sertraline, escitalopram, fluoxetine, alprazolam, clonazepam, gabapentin, pregabalin.
+- Anticoagulants/antiplatelets: warfarin, apixaban, rivaroxaban, clopidogrel.
+- Allergy/asthma: cetirizine, montelukast, albuterol/salbutamol.
+- Thyroid: levothyroxine.
+- Steroids: prednisone, prednisolone, dexamethasone.
+
+For each ingredient, store:
+
+- canonical ingredient name,
+- aliases, salts, brand names, regional names, and OCR variants,
+- common adverse effects,
+- serious warnings where available,
+- known high-risk interactions,
+- FAERS-derived evidence summary if available.
+
+#### B. Specialty/High-Risk Bundle
+
+Use the current FAERS-derived table to preserve coverage for serious high-risk medication classes:
+
+- oncology drugs,
+- transplant/immunosuppressants,
+- biologics,
+- opioids,
+- anticoagulants,
+- high-risk cardiovascular drugs.
+
+This bundle should not be selected only by raw FAERS frequency. FAERS is biased toward severe-event reporting, so the final package should combine:
+
+- common outpatient medication anchors,
+- high-support FAERS pairs,
+- high-risk curated pairs,
+- demo-critical medications.
+
+### 12.4 Required MVP SQLite artifacts
+
+Initial artifact target:
+
+- `normalization.sqlite`:
+  - `drug`: canonical ingredients,
+  - `drug_alias`: brand names, salts, regional synonyms, OCR variants.
+- `evidence.sqlite`:
+  - `pair_evidence`: FAERS-derived pair summaries,
+  - `known_interaction`: curated high-confidence interactions,
+  - `drug_adverse_effect`: common/serious adverse effects,
+  - `pair_top_reaction`: top reported reactions for a pair,
+  - `report_rule`: deterministic severity and uncertainty rules if rule data is stored.
+
+Build order:
+
+1. Pair evidence and normalization first.
+2. Known curated interactions second.
+3. Drug-level adverse effects third.
+4. Regimen evidence after pair evidence is working.
+
+---
+
+## 13. Evaluation Plan
 
 We no longer evaluate a trained classifier. We evaluate the **agentic grounded system**.
 
@@ -464,36 +575,44 @@ We can still use held-out FAERS-derived examples and curated interaction cases, 
 
 ---
 
-## 13. Open Decisions
+## 14. Open Decisions
 
 1. **Gemma package choice:** confirm the exact LiteRT-LM-compatible Gemma variant and quantization level.
 2. **Dashboard runtime shape:** fully local desktop bundle vs local service wrapper.
 3. **Regimen evidence depth:** how much regimen-level history can fit on phone after compression.
 4. **Verification strictness:** whether every final answer needs a deterministic contradiction check.
 5. **Bundle split:** how different the phone and dashboard evidence packs should be.
+6. **Online fallback scope:** decide whether online lookup is allowed in the demo, and if yes, restrict it to trusted normalization/label sources rather than interaction generation.
+7. **Common-med seed list:** freeze the first 100-300 common ingredients for US/India/EU outpatient coverage.
 
 ---
 
-## 14. Immediate Next Steps
+## 15. Immediate Next Steps
 
 1. Freeze the new architecture: **Gemma agent + compressed evidence + tool verification**, no separate ML classifier.
 2. Design the schemas for:
    - pair evidence store,
    - regimen evidence store,
    - normalization map.
-3. Build the first export/compression pipeline from our existing FAERS-derived tables.
-4. Measure size and lookup latency of a phone-ready SQLite bundle.
-5. Implement the first deterministic tools:
+3. Freeze the first Common-Med Bundle seed list covering regular US/India/EU outpatient medicines.
+4. Build `normalization.sqlite` with aliases, salts, regional names, and OCR variants.
+5. Build the first `evidence.sqlite` export/compression pipeline from existing FAERS-derived tables.
+6. Add curated known interactions and common adverse effects for the Common-Med Bundle.
+7. Measure size and lookup latency of a phone-ready SQLite bundle.
+8. Implement the first deterministic tools:
    - `normalizeMedicationNames`
    - `lookupPairEvidence`
+   - `lookupKnownInteraction`
+   - `getDrugAdverseEffects`
    - `lookupRegimenEvidence`
    - `checkSeverityConsensus`
    - `buildStructuredReport`
-6. Wire Gemma through LiteRT-LM to call those tools and produce grounded responses.
+9. Build a CLI or small local dashboard that runs medication lists through the deterministic tools before adding phone OCR.
+10. Wire Gemma through LiteRT-LM to call those tools and produce grounded responses.
 
 ---
 
-## 15. Final Project Statement
+## 16. Final Project Statement
 
 **MedLens** is now best framed as a **grounded on-device medication safety agent**:
 
