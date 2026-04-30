@@ -1,155 +1,165 @@
 # MedLens
 
-On-device polypharmacy drug interaction detection agent for Android.
-Fine-tuned Gemma 4 E2B — 100% offline, privacy-preserving.
+MedLens is an offline medication-safety prototype. It normalizes medication
+names, checks local DDI/adverse-effect signal data, and returns deterministic
+structured reports that a Gemma agent can later explain.
 
----
+Current MVP boundary:
 
-## Prerequisites
+- use the four curated DDI-ADE CSVs in `data/raw/DDI/` as the safety evidence;
+- build reproducible SQLite artifacts from those CSVs;
+- run all lookup/report logic locally;
+- do not use FAERS/PostgreSQL, fine-tuning, or an ML classifier for the active MVP.
 
-- Python 3.13
-- `uv` package manager
-- PostgreSQL running locally
-- `zcat`, `sqlite3`, `pgloader` installed (for pediatric FAERS pipeline)
+The local evidence is a screening/reference signal pack, not patient-specific
+clinical ground truth.
+
+## Current Status
+
+Implemented:
+
+- `normalization.sqlite` builder with canonical ingredients and aliases.
+- `evidence.sqlite` builder from the DDI-ADE CSVs.
+- deterministic Python lookup/report tools.
+- CLI harness for JSON or text reports.
+- unit tests for artifact builds, lookup tools, and CLI output.
+
+Current artifact shape:
+
+| Artifact | Contents |
+|---|---:|
+| `data/artifacts/normalization.sqlite` | 933 canonical medications, 1,339 aliases |
+| `data/artifacts/evidence.sqlite` | 19,706 interaction pairs, 99,813 pair-effect rows, 157,600 raw DDI signal rows |
+
+## Evidence Inputs
+
+Active raw inputs:
+
+```text
+data/raw/DDI/usa_prioritized_ddi_ade_signals.csv
+data/raw/DDI/eu_eea_prioritized_ddi_ade_signals.csv
+data/raw/DDI/india_prioritized_ddi_ade_signals.csv
+data/raw/DDI/india_expanded_prioritized_ddi_ade_signals.csv
+```
+
+These CSVs include drug pairs, adverse effects, severity, mechanism/rationale,
+regional relevance, patient risk flags, source basis, source URLs, and screening
+caveats.
+
+PostgreSQL and FAERS-derived training tables are not required for the current
+CSV-only MVP.
+
+## Setup
+
+Use Python 3.12 with `uv`.
 
 ```bash
 uv sync
-cp .env.example .env   # add your POSTGRES_URI
 ```
 
----
+The code itself only needs the Python standard library for the current artifact
+builders and CLI path. The larger dependency set in `pyproject.toml` is legacy
+from earlier experiments and should be trimmed later.
 
-## Data Pipeline
+## Build Artifacts
 
-### Step 1 — Load Pediatric FAERS (preprocessed, `public` schema)
-
-Ingests `data/raw/effect_peds_19q2_v0.3_20211119.sql.gz` (~263MB compressed)
-into PostgreSQL via temp SQLite + pgloader. Produces 17 tables (~1.1GB):
-`ade_raw`, `ade_nichd`, `sider`, `drug_gene`, etc.
+Build the normalization database:
 
 ```bash
-uv run python data/pg_builder.py
+python3 -m medlens.artifacts.build_normalization \
+  --output data/artifacts/normalization.sqlite
 ```
 
----
-
-### Step 2 — Load Raw FAERS Quarterly Data (`faers` schema)
-
-Loads FDA adverse event reports from `data/raw/faers/*.zip` (2020Q1–2025Q3).
-6 tables: `demo`, `drug`, `reac`, `outc`, `ther`, `indi`.
+Build the DDI evidence database from CSVs:
 
 ```bash
-# Load a single quarter (fast, ~1.9M drug rows)
-uv run python data/faers_explorer.py --load --quarters 2024Q1
-
-# Load all 24 quarters (~51M drug rows estimated — takes time)
-uv run python data/faers_explorer.py --load
-
-# Explore file-level stats without loading
-uv run python data/faers_explorer.py --explore
+python3 -m medlens.artifacts.build_evidence \
+  --input-dir data/raw/DDI \
+  --normalization-db data/artifacts/normalization.sqlite \
+  --output data/artifacts/evidence.sqlite
 ```
 
-> **Note:** Each `--load` run drops and recreates all tables (not incremental).
+The evidence builder records source-file import stats in
+`evidence_import_file`, unresolved rows in `ddi_import_issue`, raw rows in
+`ddi_raw_signal`, and pair summaries in `known_interaction`.
 
----
+## Run Reports
 
-### Step 3 — Explore Loaded FAERS Data
-
-Interactive DB-level exploration (11 sections). Designed for conversion to Jupyter notebook.
+JSON output:
 
 ```bash
-# Run all 11 sections
-uv run python data/faers_explore.py
-
-# List available sections
-uv run python data/faers_explore.py --list
-
-# Run specific sections
-uv run python data/faers_explore.py --sections 1 6 7
+python3 -m medlens.cli Advil Warfarin
 ```
 
-Sections cover: schema overview, null rates, role codes, outcome severity,
-drug normalization, polypharmacy, DDI pairs, drug-reaction patterns,
-demographics, training example previews, quality flags.
-
----
-
-### Step 4 — Build Training Data (`medlens` schema)
-
-Generates Unsloth-compatible instruction-tuning examples from FAERS cases.
-One table: `medlens.training_examples`.
+Text output:
 
 ```bash
-# Create/reset the table (destructive — drops if exists)
-uv run python data/training_data_builder.py --create-schema
-
-# Populate from FAERS multi-drug suspect cases (Type B examples)
-uv run python data/training_data_builder.py --build-faers --limit 5000 --thinking-mode never
-
-# Control drug count per example (default: 3–8 drugs)
-uv run python data/training_data_builder.py --build-faers --min-drugs 2 --max-drugs 6 --limit 10000
-
-# Mix direct answers with a smaller number of think-tagged examples
-uv run python data/training_data_builder.py --build-faers --limit 10000 --thinking-mode mixed
-
-# Check what was loaded
-uv run python data/training_data_builder.py --stats
+python3 -m medlens.cli --format text Advil Warfarin Paracetamol "Mystery Pill"
 ```
 
----
-
-### Step 5 — Export Training Data to JSONL
+Agent explanation over the same structured report:
 
 ```bash
-# Export all examples
-uv run python data/training_data_builder.py --export data/medlens_train.jsonl
+# Offline deterministic explanation, useful for development/tests.
+python3 -m medlens.cli --format agent --provider template Advil Warfarin
 
-# Export train split only
-uv run python data/training_data_builder.py --export data/medlens_train.jsonl --split train
+# Gemini, using GOOGLE_API_KEY and GOOGLE_MODEL from .env.
+python3 -m medlens.cli --format agent --provider gemini Advil Warfarin
+
+# AWS Bedrock Claude, using AWS_* and CLAUDE_MODEL from .env.
+python3 -m medlens.cli --format agent --provider bedrock Advil Warfarin
 ```
 
-Output format (Unsloth-compatible):
-```json
-{"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+Interactive terminal chat:
+
+```bash
+python3 -m medlens.cli --chat --provider bedrock
+python3 -m medlens.cli --chat --provider template Advil Warfarin
 ```
 
-If `--thinking-mode mixed` or `--thinking-mode always` is used, assistant labels may include an optional `<|think|>...</think>` prefix.
+Installed package entrypoint:
 
----
-
-## Database Schema
-
-| Schema     | Populated by             | Contents |
-|------------|--------------------------|----------|
-| `public`   | `pg_builder.py`          | Pediatric FAERS processed — 17 tables, ~1.1GB |
-| `faers`    | `faers_explorer.py`      | Raw FAERS quarterly dumps — 6 tables, keyed on `primaryid` |
-| `raw_data` | `pg_builder.py` (intent) | Empty in practice |
-| `medlens`  | `training_data_builder.py` | Training examples — 1 table, Unsloth JSONB format |
-
----
-
-## Training Data Coverage (from `faers` schema, 2024Q1)
-
-| Metric | Count |
-|--------|-------|
-| Multi-drug suspect cases (≥2 drugs) | ~73,000 / quarter |
-| Severe outcomes (DE/LT/HO = Major) | ~36,000 / quarter |
-| FDA-flagged DDI cases (role=I) | ~10,000 / quarter |
-| Distinct generic ingredients (`prod_ai`) | ~6,400 |
-| 24 quarters total — estimated multi-drug | ~870,000 cases |
-
----
-
-## Architecture Overview
-
+```bash
+medlens-report Advil Warfarin
 ```
-Camera (ML Kit OCR)
+
+## Test
+
+```bash
+python3 -m unittest \
+  tests.test_normalization_artifact \
+  tests.test_evidence_artifact \
+  tests.test_local_safety_tools \
+  tests.test_cli \
+  tests.test_agent
+
+python3 -m compileall medlens tests
+```
+
+## Architecture
+
+```text
+typed meds / later OCR text
     ↓
-Gemma 4 E2B (fine-tuned, LiteRT .task) — on-device, offline
-    ↓ function calling
-checkInteractions(drugs) → interaction_db.json (top 200 drugs, ~5K pairs)
+normalizeMedicationNames()
     ↓
-Severity-ranked safety report (Major / Moderate / Minor)
+lookupKnownInteraction(a, b)
+    ↓
+buildStructuredReport()
+    ↓
+JSON/text report
+    ↓ later
+Gemma explanation over structured tool output only
 ```
 
-See `medlens-plan.md` for the full 5-phase implementation plan.
+The deterministic tool layer is the authority for safety findings. Gemma should
+not invent interactions, assign severity, or add adverse effects that are not in
+the local tool output.
+
+## Next Work
+
+1. Improve normalization coverage from `ddi_import_issue`.
+2. Add a compact demo/evaluation set of medication lists.
+3. Expand the model-agnostic agent wrapper and add response verification.
+4. Build OCR and Android flows after the report schema stabilizes.
+5. Trim legacy dependencies and stale data-pipeline references.

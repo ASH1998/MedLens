@@ -1,7 +1,7 @@
 [project]
 name = "medlens"
 version = "0.0.1.dev0"
-description = "An on-device polypharmacy drug interaction agent powered by fine-tuned Gemma 4 E2B"
+description = "An on-device medication safety agent powered by Gemma and local evidence tools"
 readme = "README.md"
 requires-python = ">=3.11, <3.13"
 authors = [
@@ -42,3 +42,7 @@ url = "https://download.pytorch.org/whl/cu128"
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
+
+[project.scripts]
+medlens-report = "medlens.cli:main"
+medlens-agent = "medlens.cli:main"
