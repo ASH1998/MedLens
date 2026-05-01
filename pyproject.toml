@@ -20,7 +20,9 @@ dependencies = [
     "pandas>=3.0.2",
     "psycopg[binary]>=3.3.3",
     "python-dotenv",
+    "prompt_toolkit>=3.0.52",
     "pytorch-tokenizers>=1.2.0",
+    "rich>=14.2.0",
     "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "tiktoken>=0.12.0",
@@ -46,3 +48,4 @@ environments = ["sys_platform == 'linux'"]
 [project.scripts]
 medlens-report = "medlens.cli:main"
 medlens-agent = "medlens.cli:main"
+"medlens.cli" = "medlens.cli:main"

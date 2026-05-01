@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Repo-local executable wrapper for the MedLens CLI."""
+
+from medlens.cli import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

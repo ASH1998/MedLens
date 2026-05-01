@@ -85,42 +85,63 @@ The evidence builder records source-file import stats in
 
 ## Run Reports
 
+From the source tree, run the repo-local executable:
+
+```bash
+./medlens.cli Advil Warfarin
+```
+
+If the project is installed, or if the repo root is on your `PATH`, the same
+CLI is available as:
+
+```bash
+medlens.cli Advil Warfarin
+```
+
 JSON output:
 
 ```bash
-python3 -m medlens.cli Advil Warfarin
+./medlens.cli Advil Warfarin
 ```
 
 Text output:
 
 ```bash
-python3 -m medlens.cli --format text Advil Warfarin Paracetamol "Mystery Pill"
+./medlens.cli --format text Advil Warfarin Paracetamol "Mystery Pill"
 ```
 
 Agent explanation over the same structured report:
 
 ```bash
 # Offline deterministic explanation, useful for development/tests.
-python3 -m medlens.cli --format agent --provider template Advil Warfarin
+./medlens.cli --format agent --provider template Advil Warfarin
 
 # Gemini, using GOOGLE_API_KEY and GOOGLE_MODEL from .env.
-python3 -m medlens.cli --format agent --provider gemini Advil Warfarin
+./medlens.cli --format agent --provider gemini Advil Warfarin
 
 # AWS Bedrock Claude, using AWS_* and CLAUDE_MODEL from .env.
-python3 -m medlens.cli --format agent --provider bedrock Advil Warfarin
+./medlens.cli --format agent --provider bedrock Advil Warfarin
 ```
 
 Interactive terminal chat:
 
 ```bash
-python3 -m medlens.cli --chat --provider bedrock
-python3 -m medlens.cli --chat --provider template Advil Warfarin
+./medlens.cli --chat --provider bedrock
+./medlens.cli --chat --provider template Advil Warfarin
 ```
 
 Installed package entrypoint:
 
 ```bash
+medlens.cli Advil Warfarin
 medlens-report Advil Warfarin
+```
+
+For source-tree development without activating the project environment, the
+module form still works:
+
+```bash
+python3 -m medlens.cli Advil Warfarin
 ```
 
 ## Test

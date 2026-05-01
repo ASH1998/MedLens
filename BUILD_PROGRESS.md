@@ -265,6 +265,7 @@ python3 -m medlens.cli --format text Advil Warfarin Paracetamol "Mystery Pill"
 Installed script entrypoint after package install:
 
 ```bash
+medlens.cli Advil Warfarin
 medlens-report Advil Warfarin
 ```
 
@@ -426,7 +427,7 @@ Update:
 
 ## Module 8: Rich Terminal Chat Plan
 
-Status: planned.
+Status: first terminal-chat slice implemented.
 
 Plan document:
 
@@ -438,6 +439,247 @@ Scope:
 - Add a real chat module with session state, natural-language medication
   extraction, rich structured report rendering, and broader educational health
   Q&A guarded by local evidence boundaries.
+
+Implemented first slice:
+
+- Added provider-neutral deterministic tool registry and JSON-safe dispatch in
+  `medlens/tools/registry.py`.
+- Added reusable chat session state in `medlens/chat/session.py`.
+- Added slash command parsing in `medlens/chat/commands.py`.
+- Added Rich-capable rendering with plain-terminal fallback in
+  `medlens/chat/renderer.py`.
+- Added interactive app wiring in `medlens/chat/app.py`.
+- Rewired `python3 -m medlens.cli --chat` through the new chat app.
+- Added `search_drug_aliases` and `known_alias_terms` to
+  `MedicationSafetyStore` for alias search and lightweight natural-language
+  medication extraction.
+- Added `rich` and `prompt_toolkit` as project dependencies; the code still
+  falls back cleanly when they are absent in a lean interpreter.
+
+Current chat capabilities:
+
+- Boots without requiring an initial medication list.
+- Supports `/meds`, `/add`, `/remove`, `/report`, `/why`, `/sources`, `/trace`,
+  `/clear`, `/provider`, `/help`, and `/quit`.
+- Detects known medication aliases in short natural-language messages and adds
+  them to session state before running the structured report.
+- Captures deterministic tool traces for `/trace`.
+- Keeps existing `--format json`, `text`, `agent`, and `agent-json` paths
+  working.
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_chat_commands tests.test_tool_registry tests.test_cli tests.test_agent tests.test_local_safety_tools tests.test_evidence_artifact tests.test_normalization_artifact
+python3 -m compileall medlens tests
+python3 -m medlens.cli --format text Advil Warfarin
+```
+
+Next hardening:
+
+- Add verifier v2 before displaying cloud-provider model output.
+- Add the eval harness and richer Rich table snapshots.
+
+Update:
+
+- Added `medlens/agent_loop.py`, a native tool-calling turn loop over the
+  deterministic SQLite tool registry.
+- Added provider-neutral `ToolCall` and `ToolModelResponse` types in
+  `medlens/agent.py`.
+- Added `generate_with_tools(...)` implementations for:
+  - `TemplateProvider`: deterministic scripted tool calls for offline tests.
+  - `BedrockProvider`: Bedrock Claude native `tools` / `tool_use` /
+    `tool_result` message shape.
+  - `GeminiProvider`: Gemini `functionDeclarations` / `functionCall` /
+    `functionResponse` message shape.
+- Rewired chat turns to use `run_agent_turn(...)` instead of the old
+  single-shot report explanation path.
+- Rewired one-shot `--format agent` and `--format agent-json` to use the
+  native loop. `agent-json` now includes `used_tools` and `fallback_used`.
+- Tool-call rounds are capped at `6`, tool calls per round at `4`, and each
+  turn has a `30s` budget before deterministic report fallback.
+- Provider context is currently turn-local so every displayed answer is tied
+  to tool results from the current turn, not stale earlier turns.
+
+Current native-tool status:
+
+- SQLite tools are native and deterministic through `tools/registry.py`.
+- Template provider exercises the same native dispatch path locally.
+- Bedrock/Gemini now have native tool-call adapters, but live cloud-provider
+  verification is still pending until verifier v2 lands.
+
+Additional verification:
+
+```bash
+python3 -m unittest tests.test_agent_loop tests.test_chat_commands tests.test_tool_registry tests.test_cli tests.test_agent
+python3 -m medlens.cli --format agent-json --provider template Advil Warfarin
+python3 -m compileall medlens tests
+```
+
+Clarification update:
+
+- Added a deterministic clarification gate before native tool dispatch in chat.
+- If a message looks like a medication-list statement but no known aliases are
+  confidently extracted, MedLens asks one focused clarification question instead
+  of running an empty report.
+- Clear aliases still proceed directly into native tools; for example
+  `I am taking dolo 650 along with ondansetron` resolves to
+  `acetaminophen + ondansetron` and runs the report.
+- Unclear text such as `I am taking dolo with ondasetron` now asks the user to
+  confirm exact brand/generic names and strength.
+- Added a prompt rule to `TOOL_LOOP_SYSTEM_PROMPT`: ask one focused
+  clarification question before checking unclear medication names.
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_chat_commands tests.test_agent_loop tests.test_cli tests.test_agent
+python3 -c "from unittest.mock import patch; from medlens.cli import main; import builtins; inputs=iter(['I am taking dolo with ondasetron', '/quit']);\nwith patch.object(builtins, 'input', lambda prompt='': next(inputs)):\n    raise SystemExit(main(['--chat','--provider','template']))"
+python3 -c "from unittest.mock import patch; from medlens.cli import main; import builtins; inputs=iter(['I am taking dolo 650 along with ondansetron', '/quit']);\nwith patch.object(builtins, 'input', lambda prompt='': next(inputs)):\n    raise SystemExit(main(['--chat','--provider','template']))"
+```
+
+Debug trace update:
+
+- Added `--debug-trace <path>` to write native tool traces as JSONL.
+- One-shot `--format agent` / `agent-json` appends one JSON object per run.
+- Chat appends one JSON object per answered tool-loop turn.
+- Trace payloads include provider, fallback status, used tool names, per-tool
+  args/result/error/duration, final report, and final text.
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_agent
+python3 -m medlens.cli --format agent --provider template --debug-trace /tmp/medlens-trace.jsonl Advil Warfarin
+```
+
+Clarification regression fix:
+
+- Fixed partial medication extraction. A message such as
+  `i am taking dolo6 and ondansetron` previously allowed the model path to run
+  because `ondansetron` matched, even though `dolo6` was unclear.
+- Chat now blocks the tool loop when any medication-looking phrase in a list
+  statement is unclear.
+- The session stores pending unclear medication names and recognized names, so
+  a follow-up like `its a brand name` stays in clarification mode instead of
+  falling back to general education.
+- Clarification prompts no longer render the generic grounding footer.
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_chat_commands tests.test_agent
+python3 -c "from unittest.mock import patch; from medlens.cli import main; import builtins; inputs=iter(['Hello!', 'i am taking dolo6 and ondansetron', 'its a brand name', '/quit']);\nwith patch.object(builtins, 'input', lambda prompt='': next(inputs)):\n    raise SystemExit(main(['--chat','--provider','template']))"
+```
+
+Agent-owned tool flow update:
+
+- Removed chat-side medication extraction and clarification routing for
+  non-slash messages.
+- Chat now sends raw user text directly into `run_agent_turn(...)`; the
+  provider decides whether to call tools, ask a clarification question, or
+  answer with an educational fallback.
+- `TOOL_LOOP_SYSTEM_PROMPT` now explicitly instructs the provider to:
+  - extract medication names itself,
+  - call `normalize_medications` first for medication-list statements,
+  - call `search_drug_aliases` for unresolved names,
+  - avoid checking only the recognized subset unless the user asks for that,
+  - call `add_medications` only after names are clear enough.
+- `TemplateProvider` now mirrors that architecture for offline tests:
+  - raw user text -> `normalize_medications`,
+  - unresolved text -> `search_drug_aliases`,
+  - clear names -> `add_medications` + `build_structured_report`,
+  - unclear names -> clarification text.
+- Follow-up clarification context is handled from the chat transcript inside
+  the provider path. Example:
+  - `i am taking dolo6 and ondansetron` asks about `dolo6` and recognizes
+    `ondansetron`.
+  - `its a brand name` keeps asking for the exact brand/strength.
+  - `its Dolo 650` merges the clarified medicine with the previously
+    recognized `ondansetron` and runs the report.
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_agent_loop tests.test_agent
+python3 -c "from unittest.mock import patch; from medlens.cli import main; import builtins; inputs=iter(['Hello!', 'i am taking dolo6 and ondansetron', 'its a brand name', 'its Dolo 650', '/quit']);\nwith patch.object(builtins, 'input', lambda prompt='': next(inputs)):\n    raise SystemExit(main(['--chat','--provider','template']))"
+```
+
+Source/provenance update:
+
+- Fixed report propagation for provider calls that pass explicit
+  `medication_names` to `build_structured_report`. The loop no longer
+  overwrites that report with an empty session report.
+- Matched findings now include compact source/provenance in deterministic
+  agent output:
+  - source regions,
+  - source bases,
+  - up to two source URLs.
+- Structured report rendering also shows source basis/URLs for matched
+  findings.
+- No-match cases now say no local DDI reference signal was found and that no
+  pair-specific source is available because no local finding matched.
+- Prompt rules now explicitly prohibit saying a no-match pair is safe.
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_agent_loop tests.test_agent tests.test_cli
+python3 -c "from unittest.mock import patch; from medlens.cli import main; import builtins; inputs=iter(['I am taking Dolo 650 and ondansetron', '/quit']);\nwith patch.object(builtins, 'input', lambda prompt='': next(inputs)):\n    raise SystemExit(main(['--chat','--provider','template']))"
+./medlens.cli --format agent --provider template Advil Warfarin
+```
+
+Default response style update:
+
+- Tightened `AGENT_SYSTEM_PROMPT` and `TOOL_LOOP_SYSTEM_PROMPT` for a concise,
+  professional default tone.
+- Default answers should now be 2-5 short bullets/lines, show at most the top
+  three findings, and avoid tables, emoji, long separators, dramatic headings,
+  mechanisms, risk-factor lists, monitoring plans, or alternatives unless the
+  user asks for details.
+- Matched finding source/provenance is now inline and compact.
+- No-match wording remains conservative: no local DDI reference signal found,
+  not "safe".
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_agent_loop tests.test_agent
+python3 - <<'PY'
+from medlens.agent import TemplateProvider
+from medlens.agent_loop import run_agent_turn
+from medlens.chat.session import ChatSession
+from medlens.tools.local_safety import MedicationSafetyStore
+result = run_agent_turn(
+    provider=TemplateProvider(),
+    session=ChatSession(provider_name="template"),
+    store=MedicationSafetyStore(),
+    user_message="am taking acetaminophen ondansetron fluorouracil azithromycin",
+)
+print(result.final_text)
+PY
+```
+
+Entrypoint update:
+
+- Added an exact console-script alias named `medlens.cli`.
+- Added a repo-local executable wrapper at `./medlens.cli`.
+- After `uv sync` or an editable install, the CLI can be invoked as:
+
+```bash
+medlens.cli Advil Warfarin
+medlens.cli --chat --provider template
+```
+
+- From the repo root without installing scripts, invoke:
+
+```bash
+./medlens.cli Advil Warfarin
+./medlens.cli --chat --provider template
+```
+
+- `medlens-report` and `medlens-agent` remain available aliases.
+- `python3 -m medlens.cli ...` remains the no-install development fallback.
 
 ## Evidence Lookup Order
 
@@ -499,6 +741,63 @@ Observed normalization coverage with current `normalization.sqlite` seed:
 - EU/EEA: `311/531` drugs covered, `4,002/10,618` pairs with both drugs covered.
 
 Next normalization gaps include drug classes/placeholders, combination products, spelling variants, and specialty drugs such as `ciclosporin/cyclosporine`, `frusemide/furosemide`, `insulin nph`, `lopinavir ritonavir`, and `combined oral contraceptive pill`.
+
+Expert-tone relaxation update:
+
+- Rewrote `AGENT_SYSTEM_PROMPT` and `TOOL_LOOP_SYSTEM_PROMPT` to direct the model
+  to behave like an expert clinical pharmacist talking with a patient, not a
+  legal-disclaimer bot.
+- Removed the "2-5 short bullets / no mechanisms / no risk factors / top-3 cap"
+  restrictions. The model is now allowed (and encouraged) to use mechanism,
+  top effects, region, source basis, and source URLs from the tool result
+  directly in the answer.
+- Stopped stacking disclaimers. One natural closing nudge is allowed for Major
+  findings; closing nudges are discouraged for Moderate/Minor/no-finding cases.
+- Tool-loop guidance now frames the SQLite tools as the source of truth and
+  pushes the model to actually run them: `normalize_medications`,
+  `search_drug_aliases`, `add_medications`, `build_structured_report`,
+  `lookup_pair`, `get_pair_effects`, `severity_consensus`, `get_raw_signals`.
+- Bedrock and Gemini providers now use `max_tokens`/`maxOutputTokens` of `1500`
+  and temperature `0.4` so the relaxed prompt has room to produce a
+  substantive expert answer.
+- `_response_from_report` and `_deterministic_text_from_report` were softened
+  to a warmer voice. Test markers (`Source:`, `Ask for details`, `Overall
+  local evidence severity:`, `local screening output`,
+  `gastrointestinal bleeding`) were preserved.
+- `_educational_fallback_text` now reads as a conversational redirect rather
+  than a stacked list of disclaimers.
+- Chat welcome panel now opens with a one-line introduction and lists the
+  privacy mode + local artifact sizes without alarming "leaves device" copy.
+- The chat grounding-cue footer is suppressed when findings are present and
+  reduced to a quiet `Couldn't match locally: ...` line only when there are
+  unresolved medication names.
+
+Files changed:
+
+- `medlens/agent.py`
+- `medlens/agent_loop.py`
+- `medlens/chat/renderer.py`
+- `tests/test_agent.py` (loosened a brittle prompt-wording assertion)
+
+Citation follow-up:
+
+- The cloud model was happy with the relaxed tone but kept dropping the
+  source URLs the tool returned. Both `AGENT_SYSTEM_PROMPT` and
+  `TOOL_LOOP_SYSTEM_PROMPT` now require a "Sources" section with every
+  `source_urls` entry from the tool result (one URL per line, plus
+  regions/bases when present). Silent omission of URLs is explicitly forbidden.
+- Deterministic `_source_line_from_finding` (in both `medlens/agent.py` and
+  `medlens/agent_loop.py`) now surfaces up to 4 URLs and 3 source bases per
+  finding instead of 1, so the deterministic fallback also shows the same
+  citations the cloud answer is asked to render.
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_agent_loop tests.test_agent tests.test_cli tests.test_chat_commands tests.test_tool_registry tests.test_local_safety_tools tests.test_normalization_artifact tests.test_evidence_artifact
+python3 -m compileall medlens tests
+python3 -m medlens.cli --format agent --provider template Advil Warfarin
+```
 
 ## Decisions
 
