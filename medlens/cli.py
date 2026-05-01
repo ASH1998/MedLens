@@ -8,6 +8,9 @@ import sys
 from pathlib import Path
 
 from medlens.agent import MedicationSafetyAgent, build_provider
+from medlens.agent_loop import run_agent_turn
+from medlens.chat.app import run_terminal_chat
+from medlens.chat.session import ChatSession
 from medlens.tools.local_safety import MedicationSafetyReport, MedicationSafetyStore
 
 
@@ -37,6 +40,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Dotenv file for provider API keys.")
     parser.add_argument("--question", help="Optional user question for the agent.")
     parser.add_argument("--chat", action="store_true", help="Start an interactive terminal chat session.")
+    parser.add_argument("--debug-trace", type=Path, help="Write agent tool traces to this JSONL file.")
     return parser.parse_args(argv)
 
 
@@ -99,12 +103,38 @@ def main(argv: list[str] | None = None) -> int:
         print(report_to_text(report))
     else:
         provider = build_provider(args.provider, env_path=args.env_file)
-        agent = MedicationSafetyAgent(store, provider)
-        result = agent.answer(medications, question=args.question, effect_limit=args.effect_limit)
+        session = ChatSession(
+            provider_name=provider.name,
+            provider_model=str(getattr(provider, "model", provider.name)),
+            privacy_mode="on_device" if provider.name == "template" else "cloud",
+        )
+        question = args.question or " ".join(medications)
+        result = run_agent_turn(
+            provider=provider,
+            session=session,
+            store=store,
+            user_message=question,
+            candidate_medications=tuple(medications),
+            effect_limit=args.effect_limit,
+        )
+        if args.debug_trace:
+            write_debug_trace(args.debug_trace, result.to_debug_dict())
         if args.format == "agent-json":
-            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    {
+                        "provider": result.provider_name,
+                        "response": result.final_text,
+                        "report": result.report.to_dict() if result.report is not None else None,
+                        "used_tools": list(result.used_tools),
+                        "fallback_used": result.fallback_used,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
         else:
-            print(result.response)
+            print(result.final_text)
     return 0
 
 
@@ -112,52 +142,28 @@ def run_chat(args: argparse.Namespace) -> int:
     store = MedicationSafetyStore(args.normalization_db, args.evidence_db)
     provider = build_provider(args.provider, env_path=args.env_file)
     agent = MedicationSafetyAgent(store, provider)
-    medications = tuple(args.medications)
+    provider_model = str(getattr(provider, "model", provider.name))
+    session = ChatSession(
+        provider_name=provider.name,
+        provider_model=provider_model,
+        privacy_mode="on_device" if provider.name == "template" else "cloud",
+    )
+    return run_terminal_chat(
+        store=store,
+        agent=agent,
+        session=session,
+        initial_medications=tuple(args.medications),
+        initial_question=args.question,
+        effect_limit=args.effect_limit,
+        debug_trace_path=args.debug_trace,
+    )
 
-    print("MedLens terminal chat")
-    print("Commands: /meds item1, item2 | /report | /quit")
-    if not medications:
-        medications = split_medications(input("Medications: "))
-    if not medications:
-        print("No medications provided.", file=sys.stderr)
-        return 2
 
-    def answer(question: str | None = None) -> None:
-        result = agent.answer(medications, question=question, effect_limit=args.effect_limit)
-        print()
-        print(result.response)
-        print()
-
-    try:
-        answer(args.question)
-        while True:
-            message = input("medlens> ").strip()
-            if not message:
-                continue
-            command = message.lower()
-            if command in {"/q", "/quit", "/exit"}:
-                return 0
-            if command.startswith("/meds"):
-                updated = message[len("/meds") :].strip()
-                if not updated:
-                    updated = input("Medications: ")
-                medications = split_medications(updated)
-                if not medications:
-                    print("No medications provided.")
-                    continue
-                answer("Re-check this updated medication list.")
-                continue
-            if command == "/report":
-                report = store.build_structured_report(medications, effect_limit=args.effect_limit)
-                print(report_to_text(report))
-                continue
-            answer(message)
-    except KeyboardInterrupt:
-        print()
-        return 130
-    except RuntimeError as exc:
-        print(f"MedLens agent error: {exc}", file=sys.stderr)
-        return 1
+def write_debug_trace(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, default=str))
+        handle.write("\n")
 
 
 if __name__ == "__main__":
