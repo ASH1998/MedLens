@@ -46,7 +46,8 @@ class AgentTest(unittest.TestCase):
 
             self.assertEqual(result.response, "Grounded answer from fake model.")
             self.assertEqual(result.provider_name, "capturing")
-            self.assertIn("Use only the structured MedLens report", provider.system_prompt)
+            self.assertIn("MedLens", provider.system_prompt)
+            self.assertIn("tool", provider.system_prompt.lower())
             self.assertIn("Mystery Pill", provider.user_prompt)
             self.assertIn("ibuprofen", provider.user_prompt)
             self.assertIn("warfarin", provider.user_prompt)
@@ -125,6 +126,37 @@ class AgentTest(unittest.TestCase):
             self.assertIn("ibuprofen + warfarin", payload["response"])
             self.assertEqual(payload["report"]["overall_severity"], "Major")
 
+    def test_cli_agent_writes_debug_trace_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            normalization_db, evidence_db = self._build_fixture_artifacts(root)
+            trace_path = root / "trace.jsonl"
+            stdout = io.StringIO()
+
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "--format",
+                        "agent",
+                        "--provider",
+                        "template",
+                        "--debug-trace",
+                        str(trace_path),
+                        "--normalization-db",
+                        str(normalization_db),
+                        "--evidence-db",
+                        str(evidence_db),
+                        "Advil",
+                        "Warfarin",
+                    ]
+                )
+
+            payload = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["provider"], "template")
+            self.assertEqual(payload["used_tools"], ["normalize_medications", "add_medications", "build_structured_report"])
+            self.assertEqual(payload["report"]["overall_severity"], "Major")
+
     def test_cli_chat_runs_interactive_template_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             normalization_db, evidence_db = self._build_fixture_artifacts(Path(tmpdir))
@@ -147,6 +179,31 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertIn("MedLens terminal chat", output)
             self.assertIn("ibuprofen + warfarin", output)
+
+    def test_cli_chat_keeps_unclear_partial_match_in_clarification_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            normalization_db, evidence_db = self._build_fixture_artifacts(Path(tmpdir))
+            stdout = io.StringIO()
+
+            with redirect_stdout(stdout), patch("builtins.input", side_effect=["i am taking dolo6 and ondansetron", "its a brand name", "/quit"]):
+                exit_code = main(
+                    [
+                        "--chat",
+                        "--provider",
+                        "template",
+                        "--normalization-db",
+                        str(normalization_db),
+                        "--evidence-db",
+                        str(evidence_db),
+                    ]
+                )
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("dolo6", output)
+            self.assertIn("ondansetron", output)
+            self.assertIn("could not confidently match", output)
+            self.assertNotIn("MedLens checked", output)
 
     def _build_fixture_artifacts(self, root: Path) -> tuple[Path, Path]:
         normalization_db = root / "normalization.sqlite"

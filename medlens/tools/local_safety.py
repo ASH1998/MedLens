@@ -154,6 +154,54 @@ class MedicationSafetyStore:
                     )
         return results
 
+    def search_drug_aliases(self, query: str, limit: int = 10) -> list[dict[str, object]]:
+        """Search canonical drug names and aliases for typo/OCR recovery."""
+        if not self.normalization_db.exists():
+            raise FileNotFoundError(f"Normalization DB not found: {self.normalization_db}")
+
+        normalized_query = normalize_lookup_text(query)
+        if not normalized_query:
+            return []
+
+        pattern = f"%{normalized_query}%"
+        grouped: dict[str, list[str]] = {}
+        with sqlite3.connect(self.normalization_db) as conn:
+            for canonical_name, alias in conn.execute(
+                """
+                SELECT d.canonical_name, a.alias
+                FROM drug_alias a
+                JOIN drug d ON d.id = a.drug_id
+                WHERE a.normalized_alias LIKE ?
+                   OR d.canonical_name LIKE ?
+                ORDER BY
+                    CASE WHEN a.normalized_alias = ? THEN 0 ELSE 1 END,
+                    LENGTH(a.alias),
+                    d.canonical_name,
+                    a.alias
+                LIMIT ?
+                """,
+                (pattern, pattern, normalized_query, max(1, limit * 4)),
+            ):
+                aliases = grouped.setdefault(str(canonical_name), [])
+                alias_value = str(alias)
+                if alias_value not in aliases:
+                    aliases.append(alias_value)
+                if len(grouped) >= limit and all(len(items) >= 3 for items in grouped.values()):
+                    break
+
+        return [
+            {"canonical": canonical, "aliases": aliases[:5]}
+            for canonical, aliases in list(grouped.items())[:limit]
+        ]
+
+    def known_alias_terms(self) -> set[str]:
+        """Return normalized known aliases for lightweight terminal extraction."""
+        if not self.normalization_db.exists():
+            raise FileNotFoundError(f"Normalization DB not found: {self.normalization_db}")
+
+        with sqlite3.connect(self.normalization_db) as conn:
+            return {str(row[0]) for row in conn.execute("SELECT normalized_alias FROM drug_alias")}
+
     def lookup_known_interaction(
         self,
         drug_a: str,
