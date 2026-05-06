@@ -19,6 +19,8 @@ SEVERITY_MAP = {
     "major": "Major",
     "medium": "Moderate",
     "moderate": "Moderate",
+    "low moderate": "Moderate",
+    "lowmoderate": "Moderate",
     "low": "Minor",
     "minor": "Minor",
 }
@@ -79,6 +81,17 @@ SOURCE_SPECS: tuple[SourceSpec, ...] = (
         source_basis_column=None,
         category_column="interaction_class",
         population_relevance_column="india_relevance_context",
+    ),
+    SourceSpec(
+        filename="india_common_generic_ddi_5000.csv",
+        region="india_common_generic",
+        id_column="interaction_id",
+        evidence_column="evidence_level",
+        risk_flags_column="patient_risk_flags_india",
+        note_column="use_case_note",
+        dataset_type_column=None,
+        category_column=None,
+        population_relevance_column="india_relevance",
     ),
 )
 
