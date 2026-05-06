@@ -46,6 +46,66 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
         },
     },
     {
+        "name": "list_interactions_for_drug",
+        "description": (
+            "List known local DDI reference interactions involving one medication, ranked by severity and "
+            "evidence count. Optional filters: min_severity (Major|Moderate|Minor), region (us|eu|india), "
+            "risk_flag (free-text substring match against curated risk-flag notes)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drug": {"type": "string"},
+                "limit": {"type": "integer"},
+                "min_severity": {"type": "string"},
+                "region": {"type": "string"},
+                "risk_flag": {"type": "string"},
+            },
+            "required": ["drug"],
+        },
+    },
+    {
+        "name": "search_interactions_by_mechanism",
+        "description": (
+            "Source-text search over the curated mechanism_or_rationale and interaction_category "
+            "fields on ddi_raw_signal. Use for questions like 'CYP3A4 inhibition interactions' or "
+            "'QT prolongation pairs'. Optional filters: drug (partner anchor), region, min_severity. "
+            "Note: mechanism text varies in wording across source CSVs and may be inconsistent or "
+            "missing — results are a hint, not a clean ontology."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "drug": {"type": "string"},
+                "region": {"type": "string"},
+                "min_severity": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search_interactions",
+        "description": (
+            "Search the local DDI reference DB across all pairs by any combination of filters: "
+            "drug (partner filter), effect (adverse-effect substring), min_severity, region, risk_flag. "
+            "Use this for global questions like 'what causes hyperkalemia?' or 'major India-flagged interactions'. "
+            "Results are ranked by severity then evidence count."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drug": {"type": "string"},
+                "effect": {"type": "string"},
+                "min_severity": {"type": "string"},
+                "region": {"type": "string"},
+                "risk_flag": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
         "name": "get_pair_effects",
         "description": "Get adverse effects for a local DDI reference pair.",
         "input_schema": {
@@ -64,6 +124,24 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
         },
     },
     {
+        "name": "bulk_check_pairs",
+        "description": (
+            "For each candidate medication, look up every known DDI pair against the comparison "
+            "list. If `against` is omitted, the current session medications are used. Returns one "
+            "row per candidate with normalized form, list of findings, highest severity found, "
+            "and an unresolved flag. Useful for OCR confirmation flows and 'is X safe to add?' "
+            "questions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "candidates": {"type": "array", "items": {"type": "string"}},
+                "against": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["candidates"],
+        },
+    },
+    {
         "name": "build_structured_report",
         "description": "Build a deterministic safety report for supplied or session medications.",
         "input_schema": {"type": "object", "properties": {"medication_names": {"type": "array", "items": {"type": "string"}}}},
@@ -74,6 +152,58 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
         "input_schema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]},
     },
     {
+        "name": "list_drugs_by_category",
+        "description": (
+            "Browse curated drug categories from the normalization catalog (e.g., 'cardiovascular', "
+            "'antibiotic', 'anticoagulant_antiplatelet'). Without a category, returns all categories "
+            "with their drug counts. With a category (substring match, case-insensitive), returns "
+            "canonical drugs in that category. Useful for catalog/dataset QA and OCR exploration."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"category": {"type": "string"}, "limit": {"type": "integer"}},
+        },
+    },
+    {
+        "name": "list_aliases_for_drug",
+        "description": (
+            "List every alias (canonical, brand, generic, regional) mapped to a single canonical drug. "
+            "Use this for questions like 'what brands map to paracetamol?' Input is normalized through "
+            "the alias index first, so brand or OCR strings work as input."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"drug": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["drug"],
+        },
+    },
+    {
+        "name": "get_common_medicine_profile",
+        "description": "Look up India common-medicine metadata for a brand/generic/user-entered medicine name.",
+        "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["name"]},
+    },
+    {
+        "name": "search_common_medicines",
+        "description": (
+            "Search India common-medicine metadata by name/brand/use plus optional structured filters: "
+            "therapeutic_category (e.g., 'analgesic'), otc_or_rx ('OTC' or 'Rx'), "
+            "nlem_or_jan_aushadhi (e.g., 'NLEM', 'Jan Aushadhi'), risk_flag (substring of "
+            "patient_risk_flags_india such as 'pregnancy', 'renal', 'liver'). At least one of query "
+            "or a filter must be provided."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "therapeutic_category": {"type": "string"},
+                "otc_or_rx": {"type": "string"},
+                "nlem_or_jan_aushadhi": {"type": "string"},
+                "risk_flag": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
         "name": "severity_consensus",
         "description": "Return per-region severity and rolled-up severity for a pair.",
         "input_schema": {"type": "object", "properties": {"drug_a": {"type": "string"}, "drug_b": {"type": "string"}}, "required": ["drug_a", "drug_b"]},
@@ -82,6 +212,28 @@ TOOL_SCHEMAS: list[dict[str, object]] = [
         "name": "find_pairs_by_effect",
         "description": "Find current-session pairs with effects matching a query.",
         "input_schema": {"type": "object", "properties": {"effect": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["effect"]},
+    },
+    {
+        "name": "get_full_raw_signals",
+        "description": "Get full raw supporting DDI signal rows for a pair, including source file, source row, mechanism, flags, and source URLs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"drug_a": {"type": "string"}, "drug_b": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["drug_a", "drug_b"],
+        },
+    },
+    {
+        "name": "list_evidence_sources",
+        "description": "List DDI source files loaded into the evidence SQLite artifact with import counts.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_import_issues",
+        "description": "List unresolved DDI import rows for artifact/debug review.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"source_file": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}},
+        },
     },
     {
         "name": "evidence_about",
@@ -142,6 +294,45 @@ def _dispatch(name: str, args: dict[str, Any], *, store: MedicationSafetyStore, 
     if name == "lookup_pair":
         interaction = store.lookup_known_interaction(str(args["drug_a"]), str(args["drug_b"]), effect_limit=_limit(args, 8))
         return _interaction_summary(interaction)
+    if name == "list_interactions_for_drug":
+        normalized, interactions = store.list_interactions_for_drug(
+            str(args["drug"]),
+            limit=_limit(args, 20),
+            effect_limit=3,
+            min_severity=_optional_str(args.get("min_severity")),
+            region=_optional_str(args.get("region")),
+            risk_flag=_optional_str(args.get("risk_flag")),
+        )
+        return {
+            "drug": _normalized_to_dict(normalized),
+            "count": len(interactions),
+            "interactions": [_drug_interaction_summary(normalized.canonical_name, interaction) for interaction in interactions],
+        }
+    if name == "search_interactions_by_mechanism":
+        return store.search_interactions_by_mechanism(
+            str(args["query"]),
+            drug=_optional_str(args.get("drug")),
+            region=_optional_str(args.get("region")),
+            min_severity=_optional_str(args.get("min_severity")),
+            limit=_limit(args, 20),
+        )
+    if name == "search_interactions":
+        result = store.search_interactions(
+            drug=_optional_str(args.get("drug")),
+            effect=_optional_str(args.get("effect")),
+            min_severity=_optional_str(args.get("min_severity")),
+            region=_optional_str(args.get("region")),
+            risk_flag=_optional_str(args.get("risk_flag")),
+            limit=_limit(args, 20),
+            effect_limit=3,
+        )
+        anchor = result.drug_normalization.canonical_name if result.drug_normalization else None
+        return {
+            "filters": result.filters,
+            "drug_normalization": _normalized_to_dict(result.drug_normalization) if result.drug_normalization else None,
+            "count": len(result.interactions),
+            "interactions": [_drug_interaction_summary(anchor, interaction) for interaction in result.interactions],
+        }
     if name == "get_pair_effects":
         interaction = store.lookup_known_interaction(str(args["drug_a"]), str(args["drug_b"]), effect_limit=_limit(args, 20))
         return {"effects": [_effect_to_dict(effect) for effect in interaction.effects]}
@@ -153,6 +344,23 @@ def _dispatch(name: str, args: dict[str, Any], *, store: MedicationSafetyStore, 
             raw_signal_limit=_limit(args, 20),
         )
         return {"raw_signals": [_raw_to_dict(raw) for raw in interaction.raw_signals]}
+    if name == "get_full_raw_signals":
+        interaction = store.lookup_known_interaction(
+            str(args["drug_a"]),
+            str(args["drug_b"]),
+            effect_limit=3,
+            raw_signal_limit=_limit(args, 20),
+        )
+        return {
+            "found": interaction.found,
+            "drug_a": interaction.drug_a,
+            "drug_b": interaction.drug_b,
+            "raw_signals": [_raw_full_to_dict(raw) for raw in interaction.raw_signals],
+        }
+    if name == "bulk_check_pairs":
+        candidates = _string_list(args.get("candidates"))
+        against = _string_list(args.get("against")) if args.get("against") is not None else list(session.medication_inputs())
+        return store.bulk_check_pairs(candidates, against, effect_limit=3)
     if name == "build_structured_report":
         names = _string_list(args.get("medication_names")) if args.get("medication_names") is not None else list(session.medication_inputs())
         report = store.build_structured_report(tuple(names), effect_limit=_limit(args, 8))
@@ -161,10 +369,47 @@ def _dispatch(name: str, args: dict[str, Any], *, store: MedicationSafetyStore, 
     if name == "search_drug_aliases":
         query = str(args["query"])
         return {"query": query, "matches": store.search_drug_aliases(query, limit=_limit(args, 10))}
+    if name == "list_aliases_for_drug":
+        return store.list_aliases_for_drug(str(args["drug"]), limit=_limit(args, 100))
+    if name == "list_drugs_by_category":
+        return store.list_drugs_by_category(_optional_str(args.get("category")), limit=_limit(args, 50))
+    if name == "get_common_medicine_profile":
+        query = str(args["name"])
+        return store.get_common_medicine_profile(query, limit=_limit(args, 10))
+    if name == "search_common_medicines":
+        query = _optional_str(args.get("query"))
+        therapeutic_category = _optional_str(args.get("therapeutic_category")) or _optional_str(args.get("category"))
+        otc_or_rx = _optional_str(args.get("otc_or_rx"))
+        nlem = _optional_str(args.get("nlem_or_jan_aushadhi"))
+        risk_flag = _optional_str(args.get("risk_flag"))
+        matches = store.search_common_medicines(
+            query,
+            limit=_limit(args, 10),
+            therapeutic_category=therapeutic_category,
+            otc_or_rx=otc_or_rx,
+            nlem_or_jan_aushadhi=nlem,
+            risk_flag=risk_flag,
+        )
+        return {
+            "query": query,
+            "filters": {
+                "therapeutic_category": therapeutic_category,
+                "otc_or_rx": otc_or_rx,
+                "nlem_or_jan_aushadhi": nlem,
+                "risk_flag": risk_flag,
+            },
+            "matches": matches,
+        }
     if name == "severity_consensus":
         return _severity_consensus(str(args["drug_a"]), str(args["drug_b"]), store=store)
     if name == "find_pairs_by_effect":
         return _find_pairs_by_effect(str(args["effect"]), store=store, session=session, limit=_limit(args, 10))
+    if name == "list_evidence_sources":
+        return {"sources": store.list_evidence_sources()}
+    if name == "list_import_issues":
+        source_file = str(args["source_file"]) if args.get("source_file") is not None else None
+        query = str(args["query"]) if args.get("query") is not None else None
+        return {"issues": store.list_import_issues(source_file=source_file, query=query, limit=_limit(args, 20))}
     if name == "evidence_about":
         return _evidence_about(str(args["topic"]))
     if name == "current_session_summary":
@@ -300,6 +545,21 @@ def _interaction_summary(interaction: KnownInteraction) -> dict[str, object]:
     }
 
 
+def _drug_interaction_summary(canonical_name: str | None, interaction: KnownInteraction) -> dict[str, object]:
+    partner = interaction.drug_b if interaction.drug_a == canonical_name else interaction.drug_a
+    return {
+        "drug": canonical_name,
+        "partner": partner,
+        "drug_a": interaction.drug_a,
+        "drug_b": interaction.drug_b,
+        "severity": interaction.severity,
+        "row_count": interaction.row_count,
+        "regions": list(interaction.source_regions),
+        "top_effects": [_effect_to_dict(effect) for effect in interaction.effects],
+        "source_urls": list(interaction.source_urls),
+    }
+
+
 def _normalized_to_dict(item: NormalizedMedication) -> dict[str, object]:
     return {
         "input": item.input_name,
@@ -331,6 +591,36 @@ def _raw_to_dict(raw: RawDdiSignal) -> dict[str, object]:
         "mechanism": raw.mechanism_or_rationale,
         "caveats": raw.use_case_note,
     }
+
+
+def _raw_full_to_dict(raw: RawDdiSignal) -> dict[str, object]:
+    return {
+        "source_file": raw.source_file,
+        "source_row_number": raw.source_row_number,
+        "source_signal_id": raw.source_signal_id,
+        "region": raw.region,
+        "drug1_raw": raw.drug1_raw,
+        "drug2_raw": raw.drug2_raw,
+        "adverse_effect": raw.adverse_effect,
+        "severity": raw.severity,
+        "mechanism_or_rationale": raw.mechanism_or_rationale,
+        "interaction_category": raw.interaction_category,
+        "interaction_direction": raw.interaction_direction,
+        "evidence_basis": raw.evidence_basis,
+        "source_basis": raw.source_basis,
+        "source_urls": raw.source_urls,
+        "population_relevance": raw.population_relevance,
+        "patient_risk_flags": raw.patient_risk_flags,
+        "dataset_type": raw.dataset_type,
+        "use_case_note": raw.use_case_note,
+    }
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _string_list(value: object) -> list[str]:
