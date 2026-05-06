@@ -799,6 +799,245 @@ python3 -m compileall medlens tests
 python3 -m medlens.cli --format agent --provider template Advil Warfarin
 ```
 
+Patient-facing chat accessibility update, 2026-05-06:
+
+- Ran the terminal chat and found two issues affecting patient usability:
+  - Natural wording such as `I take Advil and Warfarin. Is that okay?`
+    was parsed too rigidly, treating trailing question text as part of the
+    medicine name.
+  - Broad questions such as `what medicines cant be taken with captopril`
+    could not be answered because the tool layer only supported specific
+    pair/list checks.
+- Relaxed the offline template medication extraction so natural questions after
+  medication names do not force unnecessary clarification.
+- Reworked deterministic/template response text to lead with practical meaning:
+  - avoids row-count-first phrasing,
+  - uses warmer pharmacist-style language,
+  - explains common medical terms such as gastrointestinal bleeding, QT
+    prolongation, intracranial hemorrhage, torsades de pointes, and acute
+    anemia in plain language,
+  - keeps citations available without overwhelming the first answer.
+- Added `MedicationSafetyStore.list_interactions_for_drug(...)`, which queries
+  `known_interaction` for all local DDI reference pairs involving one resolved
+  medication and ranks them by severity/evidence count.
+- Added `list_interactions_for_drug` to `medlens/tools/registry.py` so cloud
+  and template agents can answer broad "what interacts with X" questions using
+  the same deterministic SQLite authority.
+- Updated `TOOL_LOOP_SYSTEM_PROMPT` so provider-native tool loops know to call
+  `list_interactions_for_drug` for questions such as `what medicines interact
+  with X` or `what can't be taken with X`.
+- Updated `TemplateProvider` to detect the same broad single-drug interaction
+  intent offline and render a ranked local list.
+- Live template chat smoke test:
+
+```text
+medlens> what medicines cant be taken with captopril
+```
+
+Returned ranked locally flagged matches including:
+
+- `amiloride`
+- `diclofenac`
+- `eplerenone`
+- `ibuprofen`
+- `indomethacin`
+- `ketorolac`
+- `naproxen`
+- `spironolactone`
+
+The response now explicitly says this is not a universal do-not-take list; it
+is a local reference list of combinations worth checking with a pharmacist or
+prescriber.
+
+- Fixed `medlens/chat/app.py` so non-TTY test/piped sessions fall back to
+  `input(...)` instead of prompt_toolkit. This restored interactive CLI tests
+  under `redirect_stdout` / mocked `input`.
+
+Files changed in this slice:
+
+- `medlens/agent.py`
+- `medlens/agent_loop.py`
+- `medlens/chat/app.py`
+- `medlens/tools/local_safety.py`
+- `medlens/tools/registry.py`
+- `tests/test_agent.py`
+- `tests/test_agent_loop.py`
+- `tests/test_local_safety_tools.py`
+- `tests/test_tool_registry.py`
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_normalization_artifact tests.test_evidence_artifact tests.test_local_safety_tools tests.test_cli tests.test_agent tests.test_tool_registry tests.test_agent_loop tests.test_chat_commands
+python3 -m compileall medlens tests
+```
+
+Latest result:
+
+```text
+Ran 41 tests in 151.046s
+
+OK
+```
+
+India common-medicine and generic DDI import, 2026-05-06:
+
+- Reviewed the two new datasets:
+  - `common_medicines_india_dataset_5000.csv`: 5,000 medicine records, 189
+    unique generic/common names, 5,000 unique medicine IDs, no empty names,
+    brands, or source URLs. This is good normalization/OCR support data rather
+    than DDI evidence.
+  - `india_common_generic_ddi_5000.csv`: 5,000 DDI rows, 3,521 unique unordered
+    input pairs before normalization, no empty drugs/effects/source URLs, and a
+    mix of `Major`, `Moderate`, and `Low-Moderate` rows. It is useful as
+    screening evidence, but some rows are broad medication-safety signals
+    (`duplicate therapy`, `polypharmacy monitoring burden`) rather than hard
+    contraindication facts.
+- Added `india_common_medicine` to `normalization.sqlite` so the full 5,000-row
+  India common-medicine catalogue is queryable in SQLite.
+- Extended `build_normalization.py` to import India common medicines into:
+  - `india_common_medicine` for metadata such as strength/form, brands, local
+    use context, risk flags, and source URLs;
+  - `drug_alias` for OCR/user-input recovery using common generic names,
+    synonym-style slash names, selected salt variants, and brand examples.
+- Kept brand aliasing conservative: examples containing `component` are not
+  mapped to a single ingredient, to avoid unsafe combo-product normalization.
+- Added new DDI normalization coverage for remaining India generic DDI terms:
+  `cilnidipine`, `febuxostat`, `formoterol`, `methylcobalamin`,
+  `pitavastatin`, `teneligliptin`, `aluminium magnesium hydroxide`,
+  `calcium citrate`, plus aliases such as `aspirin high dose`,
+  `insulin regular`, and `vitamin d3`.
+- Added `india_common_generic_ddi_5000.csv` to `build_evidence.py` as
+  `india_common_generic`, including `Low-Moderate` severity normalization.
+- Rebuilt artifacts:
+  - `normalization.sqlite`: 981 drugs, 1,669 aliases, 5,000 India common
+    medicine rows.
+  - `evidence.sqlite`: 21,810 known interactions, 105,460 interaction effects,
+    162,600 raw DDI signals, 15,696 unresolved import issues, 5 source files.
+  - The new India generic DDI file imported completely after normalization
+    coverage: 5,000 seen, 5,000 imported, 0 unresolved, 3,471 unique pairs.
+- Smoke-tested local normalization:
+  - `Dolo` -> `acetaminophen`
+  - `Clavam` -> `amoxicillin clavulanate`
+  - `Cilnidipine` -> `cilnidipine`
+  - `Aspirin high dose` -> `aspirin`
+  - `Insulin regular` -> `insulin`
+- Smoke-tested terminal chat:
+
+```text
+medlens> what medicines cant be taken with captopril
+```
+
+Returned locally flagged captopril partners including `diclofenac`,
+`ibuprofen`, `naproxen`, `amiloride`, `eplerenone`, `ketorolac`,
+`spironolactone`, and `celecoxib`, with the appropriate caveat that this is not
+a universal do-not-take list.
+
+Also checked:
+
+```text
+medlens> I take Dolo and Clavam. what are these?
+```
+
+The chat resolved `Dolo` to `acetaminophen` and `Clavam` to
+`amoxicillin clavulanate` through the rebuilt SQLite aliases.
+
+Files changed in this slice:
+
+- `medlens/artifacts/schema.py`
+- `medlens/artifacts/build_normalization.py`
+- `medlens/artifacts/build_evidence.py`
+- `medlens/artifacts/common_meds.py`
+- `tests/test_normalization_artifact.py`
+- `tests/test_evidence_artifact.py`
+- fixture call updates in tests that build temporary normalization DBs
+- `CLAUDE.md`
+- `BUILD_PROGRESS.md`
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_normalization_artifact tests.test_evidence_artifact tests.test_local_safety_tools tests.test_cli tests.test_agent tests.test_tool_registry tests.test_agent_loop tests.test_chat_commands
+python3 -m compileall medlens tests
+```
+
+Latest result:
+
+```text
+Ran 43 tests in 181.666s
+
+OK
+```
+
+SQLite runtime exploration tools, 2026-05-06:
+
+- Added runtime tools for the SQLite tables that were previously only used
+  indirectly or for build/debug:
+  - `get_common_medicine_profile`
+    reads `normalization.sqlite` tables `drug`, `drug_alias`, and
+    `india_common_medicine` to explain a brand/common/generic medicine,
+    including forms/strengths, India common-use context, brand examples,
+    OTC/Rx context, risk flags, and source URLs.
+  - `search_common_medicines`
+    searches `india_common_medicine` by common name, brand examples, daily-life
+    use, or therapeutic category.
+  - `list_evidence_sources`
+    reads `evidence_import_file` so the agent can show which DDI CSVs were
+    loaded and how many rows/pairs resolved.
+  - `list_import_issues`
+    reads `ddi_import_issue` for unresolved import/debug review.
+  - `get_full_raw_signals`
+    returns full `ddi_raw_signal` support rows for pair-level auditing, while
+    keeping the existing simplified `get_raw_signals` tool intact.
+- Updated `TOOL_SCHEMAS` and dispatch in `medlens/tools/registry.py` so the new
+  tools are available to Bedrock/Gemini/template agent loops.
+- Updated `AGENT_SYSTEM_PROMPT` and `TOOL_LOOP_SYSTEM_PROMPT`:
+  - normalization/OCR/brand/common-medicine questions should use
+    normalization.sqlite-backed tools;
+  - interaction/effect/severity/source/raw-row questions should use
+    evidence.sqlite-backed tools;
+  - dataset coverage questions should call `list_evidence_sources`;
+  - unresolved/import/debug questions should call `list_import_issues`;
+  - raw-row/audit questions should call `get_full_raw_signals`.
+- Extended the offline template provider so local chat can use these tools
+  without a cloud model:
+  - `I take Dolo. what is this used for?` calls
+    `get_common_medicine_profile`.
+  - `what evidence sources are loaded?` calls `list_evidence_sources`.
+  - `show import issues for unknown` calls `list_import_issues`.
+- Added regression tests in:
+  - `tests/test_local_safety_tools.py`
+  - `tests/test_tool_registry.py`
+  - `tests/test_agent_loop.py`
+
+Current runtime table coverage:
+
+| SQLite DB | Table | Runtime tool coverage |
+| --- | --- | --- |
+| `normalization.sqlite` | `drug` | normalization, alias search, common profile/search, pair/report tools through normalization |
+| `normalization.sqlite` | `drug_alias` | normalization, alias search, session add/remove, pair/list/report tools |
+| `normalization.sqlite` | `india_common_medicine` | `get_common_medicine_profile`, `search_common_medicines` |
+| `evidence.sqlite` | `known_interaction` | pair lookup, single-drug interaction listing, report, effects, raw-signal tools, severity consensus, effect search |
+| `evidence.sqlite` | `known_interaction_effect` | pair lookup, single-drug interaction listing, report, effects, effect search |
+| `evidence.sqlite` | `ddi_raw_signal` | report/pair lookup raw support, `get_raw_signals`, `get_full_raw_signals`, severity consensus |
+| `evidence.sqlite` | `evidence_import_file` | `list_evidence_sources` |
+| `evidence.sqlite` | `ddi_import_issue` | `list_import_issues` |
+
+Verification:
+
+```bash
+python3 -m unittest tests.test_normalization_artifact tests.test_evidence_artifact tests.test_local_safety_tools tests.test_cli tests.test_agent tests.test_tool_registry tests.test_agent_loop tests.test_chat_commands
+python3 -m compileall medlens tests
+```
+
+Latest result:
+
+```text
+Ran 48 tests in 229.886s
+
+OK
+```
+
 ## Decisions
 
 - Generated SQLite artifacts are ignored by git because they are reproducible build outputs.
