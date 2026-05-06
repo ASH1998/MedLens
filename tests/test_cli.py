@@ -71,7 +71,7 @@ class CliTest(unittest.TestCase):
         evidence_db = root / "evidence.sqlite"
         ddi_dir = root / "DDI"
         ddi_dir.mkdir()
-        build_normalization_db(normalization_db)
+        build_normalization_db(normalization_db, common_medicines_csv=None)
         self._write_usa_fixture(ddi_dir / "usa_prioritized_ddi_ade_signals.csv")
         build_evidence_db(ddi_dir, normalization_db, evidence_db)
         return normalization_db, evidence_db
