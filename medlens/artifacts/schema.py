@@ -21,9 +21,33 @@ CREATE TABLE IF NOT EXISTS drug_alias (
     region TEXT NOT NULL DEFAULT 'global'
 );
 
+CREATE TABLE IF NOT EXISTS india_common_medicine (
+    id INTEGER PRIMARY KEY,
+    medicine_id TEXT NOT NULL UNIQUE,
+    drug_id INTEGER NOT NULL REFERENCES drug(id) ON DELETE CASCADE,
+    source_row_number INTEGER NOT NULL,
+    generic_or_common_name TEXT NOT NULL,
+    normalized_generic_name TEXT NOT NULL,
+    composition_or_strength_pattern TEXT NOT NULL,
+    dosage_form TEXT NOT NULL,
+    therapeutic_category TEXT NOT NULL,
+    common_daily_life_use_india TEXT NOT NULL,
+    common_brand_examples_india TEXT NOT NULL,
+    availability_context_india TEXT NOT NULL,
+    otc_or_rx TEXT NOT NULL,
+    nlem_or_jan_aushadhi_presence TEXT NOT NULL,
+    india_relevance TEXT NOT NULL,
+    patient_risk_flags_india TEXT NOT NULL,
+    source_basis TEXT NOT NULL,
+    source_urls TEXT NOT NULL,
+    dataset_note TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_drug_alias_drug_id ON drug_alias(drug_id);
 CREATE INDEX IF NOT EXISTS idx_drug_alias_normalized ON drug_alias(normalized_alias);
 CREATE INDEX IF NOT EXISTS idx_drug_category ON drug(category);
+CREATE INDEX IF NOT EXISTS idx_india_common_medicine_drug_id ON india_common_medicine(drug_id);
+CREATE INDEX IF NOT EXISTS idx_india_common_medicine_normalized ON india_common_medicine(normalized_generic_name);
 """
 
 EVIDENCE_SCHEMA = """

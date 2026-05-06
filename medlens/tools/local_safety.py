@@ -77,6 +77,13 @@ class KnownInteraction:
 
 
 @dataclass(frozen=True)
+class InteractionSearchResult:
+    filters: dict[str, object]
+    drug_normalization: NormalizedMedication | None
+    interactions: tuple[KnownInteraction, ...]
+
+
+@dataclass(frozen=True)
 class MedicationSafetyReport:
     input_medications: tuple[str, ...]
     normalized_medications: tuple[NormalizedMedication, ...]
@@ -194,6 +201,353 @@ class MedicationSafetyStore:
             for canonical, aliases in list(grouped.items())[:limit]
         ]
 
+    def search_common_medicines(
+        self,
+        query: str | None = None,
+        limit: int = 10,
+        *,
+        therapeutic_category: str | None = None,
+        otc_or_rx: str | None = None,
+        nlem_or_jan_aushadhi: str | None = None,
+        risk_flag: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Search India common-medicine metadata, with optional structured filters."""
+        if not self.normalization_db.exists():
+            raise FileNotFoundError(f"Normalization DB not found: {self.normalization_db}")
+
+        clauses: list[str] = []
+        params: list[object] = []
+        normalized_query: str | None = None
+
+        if query and query.strip():
+            normalized_query = normalize_lookup_text(query)
+            if normalized_query:
+                pattern = f"%{normalized_query}%"
+                text_pattern = f"%{query.casefold().strip()}%"
+                clauses.append(
+                    "(m.normalized_generic_name LIKE ?"
+                    " OR lower(m.common_brand_examples_india) LIKE ?"
+                    " OR lower(m.common_daily_life_use_india) LIKE ?"
+                    " OR lower(m.therapeutic_category) LIKE ?)"
+                )
+                params.extend([pattern, text_pattern, text_pattern, text_pattern])
+
+        if therapeutic_category and therapeutic_category.strip():
+            clauses.append("lower(m.therapeutic_category) LIKE ?")
+            params.append(f"%{therapeutic_category.casefold().strip()}%")
+
+        if otc_or_rx and otc_or_rx.strip():
+            clauses.append("lower(m.otc_or_rx) LIKE ?")
+            params.append(f"%{otc_or_rx.casefold().strip()}%")
+
+        if nlem_or_jan_aushadhi and nlem_or_jan_aushadhi.strip():
+            clauses.append("lower(m.nlem_or_jan_aushadhi_presence) LIKE ?")
+            params.append(f"%{nlem_or_jan_aushadhi.casefold().strip()}%")
+
+        if risk_flag and risk_flag.strip():
+            clauses.append("lower(m.patient_risk_flags_india) LIKE ?")
+            params.append(f"%{risk_flag.casefold().strip()}%")
+
+        if not clauses:
+            return []
+
+        where = " AND ".join(clauses)
+        order_exact = normalized_query if normalized_query else ""
+        params.extend([order_exact, max(1, limit)])
+
+        with sqlite3.connect(self.normalization_db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT m.*, d.canonical_name
+                FROM india_common_medicine m
+                JOIN drug d ON d.id = m.drug_id
+                WHERE {where}
+                ORDER BY
+                    CASE WHEN m.normalized_generic_name = ? THEN 0 ELSE 1 END,
+                    d.canonical_name,
+                    m.source_row_number
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+
+        return [_common_medicine_row_to_dict(row) for row in rows]
+
+    def get_common_medicine_profile(self, name: str, limit: int = 10) -> dict[str, object]:
+        """Return India common-medicine metadata for a user/brand/generic name."""
+        if not self.normalization_db.exists():
+            raise FileNotFoundError(f"Normalization DB not found: {self.normalization_db}")
+
+        normalized = self.normalize_medication_names([name])[0]
+        rows: list[sqlite3.Row] = []
+        aliases: tuple[str, ...] = ()
+        if normalized.resolved and normalized.drug_id is not None:
+            with sqlite3.connect(self.normalization_db) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT m.*, d.canonical_name
+                    FROM india_common_medicine m
+                    JOIN drug d ON d.id = m.drug_id
+                    WHERE m.drug_id = ?
+                    ORDER BY m.source_row_number
+                    LIMIT ?
+                    """,
+                    (normalized.drug_id, max(1, limit)),
+                ).fetchall()
+                aliases = tuple(
+                    str(row["alias"])
+                    for row in conn.execute(
+                        """
+                        SELECT alias
+                        FROM drug_alias
+                        WHERE drug_id = ?
+                        ORDER BY
+                            CASE alias_type WHEN 'canonical' THEN 0 WHEN 'brand' THEN 1 ELSE 2 END,
+                            LENGTH(alias),
+                            alias
+                        LIMIT 20
+                        """,
+                        (normalized.drug_id,),
+                    )
+                )
+
+        if not rows:
+            matches = self.search_common_medicines(name, limit=limit)
+            return {
+                "query": name,
+                "normalized": _normalized_medication_to_dict(normalized),
+                "aliases": list(aliases),
+                "matches": matches,
+            }
+
+        return {
+            "query": name,
+            "normalized": _normalized_medication_to_dict(normalized),
+            "aliases": list(aliases),
+            "matches": [_common_medicine_row_to_dict(row) for row in rows],
+        }
+
+    def search_interactions_by_mechanism(
+        self,
+        query: str,
+        *,
+        drug: str | None = None,
+        region: str | None = None,
+        min_severity: str | None = None,
+        limit: int = 20,
+        sample_per_pair: int = 3,
+    ) -> dict[str, object]:
+        """Source-text search over ddi_raw_signal mechanism_or_rationale + interaction_category.
+
+        Returns matching pairs plus up to ``sample_per_pair`` excerpts of the matching
+        mechanism/category text. Mechanism free-text is curated per source CSV and may be
+        noisy or inconsistent across rows; treat as a hint, not a clean ontology.
+        """
+        if not query or not query.strip():
+            raise ValueError("query is required")
+        if not self.evidence_db.exists():
+            raise FileNotFoundError(f"Evidence DB not found: {self.evidence_db}")
+
+        drug_normalization: NormalizedMedication | None = None
+        drug_canonical: str | None = None
+        if drug is not None and drug.strip():
+            drug_normalization = self.normalize_medication_names([drug])[0]
+            if not drug_normalization.resolved or drug_normalization.canonical_name is None:
+                return {
+                    "query": query,
+                    "filters": {"drug": drug, "region": region, "min_severity": min_severity},
+                    "drug_normalization": _normalized_medication_to_dict(drug_normalization),
+                    "count": 0,
+                    "matches": [],
+                }
+            drug_canonical = drug_normalization.canonical_name
+
+        where_ki, params_ki, _needs_join = _build_interaction_filters(
+            drug_canonical=drug_canonical,
+            effect=None,
+            min_severity=min_severity,
+            region=region,
+            risk_flag=None,
+        )
+        mech_pattern = f"%{query.casefold().strip()}%"
+        params: list[object] = [mech_pattern, mech_pattern, *params_ki, max(1, int(limit))]
+
+        with sqlite3.connect(self.evidence_db) as conn:
+            conn.row_factory = sqlite3.Row
+            pair_rows = conn.execute(
+                f"""
+                SELECT DISTINCT ki.id, ki.drug_a, ki.drug_b, ki.severity, ki.severity_rank,
+                                ki.row_count, ki.source_regions_json
+                FROM known_interaction ki
+                JOIN ddi_raw_signal r ON r.known_interaction_id = ki.id
+                WHERE (lower(r.mechanism_or_rationale) LIKE ? OR lower(r.interaction_category) LIKE ?)
+                  AND ({where_ki})
+                ORDER BY ki.severity_rank DESC, ki.row_count DESC, ki.drug_a, ki.drug_b
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+
+            matches: list[dict[str, object]] = []
+            for pair in pair_rows:
+                samples = conn.execute(
+                    """
+                    SELECT mechanism_or_rationale, interaction_category, region
+                    FROM ddi_raw_signal
+                    WHERE known_interaction_id = ?
+                      AND (lower(mechanism_or_rationale) LIKE ? OR lower(interaction_category) LIKE ?)
+                    LIMIT ?
+                    """,
+                    (int(pair["id"]), mech_pattern, mech_pattern, max(1, int(sample_per_pair))),
+                ).fetchall()
+                seen_mech: set[str] = set()
+                seen_cat: set[str] = set()
+                mechanisms: list[str] = []
+                categories: list[str] = []
+                for sample in samples:
+                    mech = (sample["mechanism_or_rationale"] or "").strip()
+                    cat = (sample["interaction_category"] or "").strip()
+                    if mech and mech not in seen_mech:
+                        mechanisms.append(mech)
+                        seen_mech.add(mech)
+                    if cat and cat not in seen_cat:
+                        categories.append(cat)
+                        seen_cat.add(cat)
+                matches.append(
+                    {
+                        "drug_a": str(pair["drug_a"]),
+                        "drug_b": str(pair["drug_b"]),
+                        "severity": str(pair["severity"]),
+                        "row_count": int(pair["row_count"]),
+                        "regions": list(_json_tuple(pair["source_regions_json"])),
+                        "matched_mechanisms": mechanisms,
+                        "matched_categories": categories,
+                    }
+                )
+
+        return {
+            "query": query,
+            "filters": {"drug": drug, "region": region, "min_severity": min_severity},
+            "drug_normalization": _normalized_medication_to_dict(drug_normalization) if drug_normalization else None,
+            "count": len(matches),
+            "matches": matches,
+            "note": "Mechanism text is curated per source CSV and may be inconsistent; treat results as a hint.",
+        }
+
+    def list_drugs_by_category(
+        self,
+        category: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        """Browse curated drug categories.
+
+        With no `category`, returns the catalog of categories with drug counts. With a
+        `category` (substring match, case-insensitive), returns canonical drugs in that
+        category ordered alphabetically.
+        """
+        if not self.normalization_db.exists():
+            raise FileNotFoundError(f"Normalization DB not found: {self.normalization_db}")
+
+        with sqlite3.connect(self.normalization_db) as conn:
+            conn.row_factory = sqlite3.Row
+            if category is None or not category.strip():
+                rows = conn.execute(
+                    """
+                    SELECT category, COUNT(*) AS drug_count
+                    FROM drug
+                    GROUP BY category
+                    ORDER BY drug_count DESC, category
+                    """
+                ).fetchall()
+                return {
+                    "category": None,
+                    "categories": [
+                        {"category": str(row["category"]), "drug_count": int(row["drug_count"])}
+                        for row in rows
+                    ],
+                    "drugs": [],
+                    "count": 0,
+                }
+
+            pattern = f"%{category.casefold().strip()}%"
+            rows = conn.execute(
+                """
+                SELECT canonical_name, category, region_scope, is_common
+                FROM drug
+                WHERE lower(category) LIKE ?
+                ORDER BY canonical_name
+                LIMIT ?
+                """,
+                (pattern, max(1, int(limit))),
+            ).fetchall()
+            drugs = [
+                {
+                    "canonical_name": str(row["canonical_name"]),
+                    "category": str(row["category"]),
+                    "region_scope": str(row["region_scope"]),
+                    "is_common": bool(row["is_common"]),
+                }
+                for row in rows
+            ]
+            return {
+                "category": category,
+                "categories": [],
+                "drugs": drugs,
+                "count": len(drugs),
+            }
+
+    def list_aliases_for_drug(self, drug: str, limit: int = 100) -> dict[str, object]:
+        """List every alias mapped to a canonical drug, grouped by alias_type."""
+        if not self.normalization_db.exists():
+            raise FileNotFoundError(f"Normalization DB not found: {self.normalization_db}")
+
+        normalized = self.normalize_medication_names([drug])[0]
+        if not normalized.resolved or normalized.drug_id is None:
+            return {
+                "drug": _normalized_medication_to_dict(normalized),
+                "count": 0,
+                "aliases": [],
+                "by_type": {},
+            }
+
+        with sqlite3.connect(self.normalization_db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT alias, alias_type, region
+                FROM drug_alias
+                WHERE drug_id = ?
+                ORDER BY
+                    CASE alias_type
+                        WHEN 'canonical' THEN 0
+                        WHEN 'brand' THEN 1
+                        WHEN 'common_generic' THEN 2
+                        WHEN 'regional_common' THEN 3
+                        ELSE 4
+                    END,
+                    LENGTH(alias),
+                    alias
+                LIMIT ?
+                """,
+                (normalized.drug_id, max(1, int(limit))),
+            ).fetchall()
+
+        aliases = [
+            {"alias": str(row["alias"]), "alias_type": str(row["alias_type"]), "region": str(row["region"])}
+            for row in rows
+        ]
+        by_type: dict[str, list[str]] = {}
+        for entry in aliases:
+            by_type.setdefault(entry["alias_type"], []).append(entry["alias"])
+        return {
+            "drug": _normalized_medication_to_dict(normalized),
+            "count": len(aliases),
+            "aliases": aliases,
+            "by_type": by_type,
+        }
+
     def known_alias_terms(self) -> set[str]:
         """Return normalized known aliases for lightweight terminal extraction."""
         if not self.normalization_db.exists():
@@ -306,6 +660,136 @@ class MedicationSafetyStore:
             raw_signals=raw_signals,
         )
 
+    def list_interactions_for_drug(
+        self,
+        drug: str,
+        limit: int = 20,
+        effect_limit: int = 3,
+        *,
+        min_severity: str | None = None,
+        region: str | None = None,
+        risk_flag: str | None = None,
+    ) -> tuple[NormalizedMedication, tuple[KnownInteraction, ...]]:
+        """List known/reference DDI pairs involving one normalized drug."""
+        normalized = self.normalize_medication_names([drug])[0]
+        if not normalized.resolved or normalized.canonical_name is None:
+            return normalized, ()
+        if not self.evidence_db.exists():
+            raise FileNotFoundError(f"Evidence DB not found: {self.evidence_db}")
+
+        where, params, _needs_join = _build_interaction_filters(
+            drug_canonical=normalized.canonical_name,
+            effect=None,
+            min_severity=min_severity,
+            region=region,
+            risk_flag=risk_flag,
+        )
+        params.append(max(1, limit))
+
+        with sqlite3.connect(self.evidence_db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT ki.drug_a, ki.drug_b
+                FROM known_interaction ki
+                WHERE {where}
+                ORDER BY ki.severity_rank DESC, ki.row_count DESC, ki.drug_a, ki.drug_b
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+
+        interactions = tuple(
+            self.lookup_known_interaction(
+                str(row["drug_a"]),
+                str(row["drug_b"]),
+                effect_limit=effect_limit,
+                raw_signal_limit=0,
+            )
+            for row in rows
+        )
+        return normalized, interactions
+
+    def search_interactions(
+        self,
+        *,
+        drug: str | None = None,
+        effect: str | None = None,
+        min_severity: str | None = None,
+        region: str | None = None,
+        risk_flag: str | None = None,
+        limit: int = 20,
+        effect_limit: int = 3,
+    ) -> InteractionSearchResult:
+        """Search known DDI pairs across the whole evidence DB by any combination of filters."""
+        if not self.evidence_db.exists():
+            raise FileNotFoundError(f"Evidence DB not found: {self.evidence_db}")
+
+        echoed_filters: dict[str, object] = {
+            "drug": drug,
+            "effect": effect,
+            "min_severity": min_severity,
+            "region": region,
+            "risk_flag": risk_flag,
+            "limit": max(1, int(limit)),
+        }
+
+        drug_normalization: NormalizedMedication | None = None
+        drug_canonical: str | None = None
+        if drug is not None and drug.strip():
+            drug_normalization = self.normalize_medication_names([drug])[0]
+            if not drug_normalization.resolved or drug_normalization.canonical_name is None:
+                return InteractionSearchResult(
+                    filters=echoed_filters,
+                    drug_normalization=drug_normalization,
+                    interactions=(),
+                )
+            drug_canonical = drug_normalization.canonical_name
+
+        where, params, needs_effect_join = _build_interaction_filters(
+            drug_canonical=drug_canonical,
+            effect=effect,
+            min_severity=min_severity,
+            region=region,
+            risk_flag=risk_flag,
+        )
+        join_sql = (
+            "JOIN known_interaction_effect kie ON kie.known_interaction_id = ki.id"
+            if needs_effect_join
+            else ""
+        )
+        distinct_sql = "DISTINCT" if needs_effect_join else ""
+        params.append(max(1, int(limit)))
+
+        with sqlite3.connect(self.evidence_db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT {distinct_sql} ki.drug_a, ki.drug_b, ki.severity_rank, ki.row_count
+                FROM known_interaction ki
+                {join_sql}
+                WHERE {where}
+                ORDER BY ki.severity_rank DESC, ki.row_count DESC, ki.drug_a, ki.drug_b
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+
+        interactions = tuple(
+            self.lookup_known_interaction(
+                str(row["drug_a"]),
+                str(row["drug_b"]),
+                effect_limit=effect_limit,
+                raw_signal_limit=0,
+            )
+            for row in rows
+        )
+        return InteractionSearchResult(
+            filters=echoed_filters,
+            drug_normalization=drug_normalization,
+            interactions=interactions,
+        )
+
     def build_structured_report(
         self,
         medication_names: list[str] | tuple[str, ...],
@@ -340,6 +824,245 @@ class MedicationSafetyStore:
             evidence_status=_evidence_status(ranked_findings, unresolved, checked_pair_count),
             limitations=limitations,
         )
+
+    def bulk_check_pairs(
+        self,
+        candidates: list[str] | tuple[str, ...],
+        against: list[str] | tuple[str, ...],
+        *,
+        effect_limit: int = 3,
+    ) -> dict[str, object]:
+        """Check each candidate medication against every drug in ``against``.
+
+        Returns one row per candidate with normalized form, the list of known interactions
+        against the comparison set, the highest severity found, and an unresolved flag if
+        the candidate could not be normalized.
+        """
+        if not self.evidence_db.exists():
+            raise FileNotFoundError(f"Evidence DB not found: {self.evidence_db}")
+
+        against_normalized = tuple(self.normalize_medication_names(tuple(against)))
+        against_canonicals: list[str] = []
+        seen_canonicals: set[str] = set()
+        for item in against_normalized:
+            if item.resolved and item.canonical_name and item.canonical_name not in seen_canonicals:
+                against_canonicals.append(item.canonical_name)
+                seen_canonicals.add(item.canonical_name)
+
+        candidate_normalized = tuple(self.normalize_medication_names(tuple(candidates)))
+        candidate_results: list[dict[str, object]] = []
+        unresolved: list[NormalizedMedication] = []
+        overall_rank = 0
+        overall_severity = "None"
+
+        for candidate in candidate_normalized:
+            if not candidate.resolved or candidate.canonical_name is None:
+                unresolved.append(candidate)
+                candidate_results.append(
+                    {
+                        "candidate": candidate.input_name,
+                        "normalized": _normalized_medication_to_dict(candidate),
+                        "findings": [],
+                        "highest_severity": "None",
+                        "interaction_count": 0,
+                        "unresolved": True,
+                    }
+                )
+                continue
+
+            findings: list[dict[str, object]] = []
+            best_rank = 0
+            best_severity = "None"
+            for partner in against_canonicals:
+                if partner == candidate.canonical_name:
+                    continue
+                interaction = self.lookup_known_interaction(
+                    candidate.canonical_name,
+                    partner,
+                    effect_limit=effect_limit,
+                    raw_signal_limit=0,
+                )
+                if not interaction.found:
+                    continue
+                findings.append(_known_interaction_to_dict(interaction))
+                rank = _severity_rank(interaction.severity)
+                if rank > best_rank:
+                    best_rank = rank
+                    best_severity = interaction.severity or "None"
+
+            if best_rank > overall_rank:
+                overall_rank = best_rank
+                overall_severity = best_severity
+
+            candidate_results.append(
+                {
+                    "candidate": candidate.input_name,
+                    "normalized": _normalized_medication_to_dict(candidate),
+                    "findings": findings,
+                    "highest_severity": best_severity,
+                    "interaction_count": len(findings),
+                    "unresolved": False,
+                }
+            )
+
+        return {
+            "against": [_normalized_medication_to_dict(item) for item in against_normalized],
+            "candidates": candidate_results,
+            "unresolved_candidates": [_normalized_medication_to_dict(item) for item in unresolved],
+            "overall_severity": overall_severity,
+        }
+
+    def list_evidence_sources(self) -> list[dict[str, object]]:
+        """Return source-file import stats from the evidence artifact."""
+        if not self.evidence_db.exists():
+            raise FileNotFoundError(f"Evidence DB not found: {self.evidence_db}")
+
+        with sqlite3.connect(self.evidence_db) as conn:
+            conn.row_factory = sqlite3.Row
+            return [
+                {
+                    "source_file": str(row["source_file"]),
+                    "region": str(row["region"]),
+                    "rows_seen": int(row["rows_seen"]),
+                    "rows_imported": int(row["rows_imported"]),
+                    "rows_unresolved": int(row["rows_unresolved"]),
+                    "unique_pairs_imported": int(row["unique_pairs_imported"]),
+                }
+                for row in conn.execute(
+                    """
+                    SELECT source_file, region, rows_seen, rows_imported, rows_unresolved, unique_pairs_imported
+                    FROM evidence_import_file
+                    ORDER BY source_file
+                    """
+                )
+            ]
+
+    def list_import_issues(
+        self,
+        source_file: str | None = None,
+        query: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        """Return unresolved DDI import rows for artifact/debug review."""
+        if not self.evidence_db.exists():
+            raise FileNotFoundError(f"Evidence DB not found: {self.evidence_db}")
+
+        clauses: list[str] = []
+        params: list[object] = []
+        if source_file:
+            clauses.append("source_file = ?")
+            params.append(source_file)
+        if query:
+            normalized_query = normalize_lookup_text(query)
+            clauses.append("(normalized_drug1 LIKE ? OR normalized_drug2 LIKE ? OR drug1 LIKE ? OR drug2 LIKE ?)")
+            pattern = f"%{normalized_query}%"
+            text_pattern = f"%{query.strip()}%"
+            params.extend([pattern, pattern, text_pattern, text_pattern])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, limit))
+
+        with sqlite3.connect(self.evidence_db) as conn:
+            conn.row_factory = sqlite3.Row
+            return [
+                {
+                    "source_file": str(row["source_file"]),
+                    "row_number": int(row["row_number"]),
+                    "drug1": str(row["drug1"]),
+                    "drug2": str(row["drug2"]),
+                    "normalized_drug1": str(row["normalized_drug1"]),
+                    "normalized_drug2": str(row["normalized_drug2"]),
+                    "reason": str(row["reason"]),
+                }
+                for row in conn.execute(
+                    f"""
+                    SELECT source_file, row_number, drug1, drug2, normalized_drug1, normalized_drug2, reason
+                    FROM ddi_import_issue
+                    {where}
+                    ORDER BY source_file, row_number
+                    LIMIT ?
+                    """,
+                    params,
+                )
+            ]
+
+
+_REGION_ALIASES: dict[str, tuple[str, ...]] = {
+    "us": ("us",),
+    "usa": ("us",),
+    "united states": ("us",),
+    "united states of america": ("us",),
+    "eu": ("eu/eea",),
+    "eea": ("eu/eea",),
+    "europe": ("eu/eea",),
+    "european union": ("eu/eea",),
+    "eu/eea": ("eu/eea",),
+    "in": ("india", "india_expanded", "india_common_generic"),
+    "india": ("india", "india_expanded", "india_common_generic"),
+    "india_expanded": ("india_expanded",),
+    "india_common_generic": ("india_common_generic",),
+}
+
+
+def _canonicalize_region(region: str) -> tuple[str, ...]:
+    key = region.casefold().strip()
+    if not key:
+        return ()
+    return _REGION_ALIASES.get(key, (key,))
+
+
+def _input_severity_rank(severity: str) -> int:
+    return {
+        "major": 3,
+        "moderate": 2,
+        "minor": 1,
+        "high": 3,
+        "medium": 2,
+        "low": 1,
+    }.get(severity.casefold().strip(), 0)
+
+
+def _build_interaction_filters(
+    *,
+    drug_canonical: str | None,
+    effect: str | None,
+    min_severity: str | None,
+    region: str | None,
+    risk_flag: str | None,
+) -> tuple[str, list[object], bool]:
+    """Build a WHERE clause + params for known_interaction (alias `ki`)."""
+    clauses: list[str] = []
+    params: list[object] = []
+    needs_effect_join = False
+
+    if drug_canonical:
+        clauses.append("(ki.drug_a = ? OR ki.drug_b = ?)")
+        params.extend([drug_canonical, drug_canonical])
+
+    if min_severity:
+        rank = _input_severity_rank(min_severity)
+        if rank > 0:
+            clauses.append("ki.severity_rank >= ?")
+            params.append(rank)
+
+    if region:
+        canonical = _canonicalize_region(region)
+        if canonical:
+            sub = " OR ".join("ki.source_regions_json LIKE ?" for _ in canonical)
+            clauses.append(f"({sub})")
+            for value in canonical:
+                params.append(f'%"{value}"%')
+
+    if risk_flag and risk_flag.strip():
+        clauses.append("lower(ki.risk_flags_json) LIKE ?")
+        params.append(f"%{risk_flag.casefold().strip()}%")
+
+    if effect and effect.strip():
+        needs_effect_join = True
+        clauses.append("lower(kie.adverse_effect) LIKE ?")
+        params.append(f"%{effect.casefold().strip()}%")
+
+    where = " AND ".join(clauses) if clauses else "1=1"
+    return where, params, needs_effect_join
 
 
 def _json_tuple(value: str) -> tuple[str, ...]:
@@ -387,6 +1110,27 @@ def _raw_ddi_signal_to_dict(raw: RawDdiSignal) -> dict[str, object]:
         "patient_risk_flags": raw.patient_risk_flags,
         "dataset_type": raw.dataset_type,
         "use_case_note": raw.use_case_note,
+    }
+
+
+def _common_medicine_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "medicine_id": str(row["medicine_id"]),
+        "canonical_name": str(row["canonical_name"]),
+        "generic_or_common_name": str(row["generic_or_common_name"]),
+        "composition_or_strength_pattern": str(row["composition_or_strength_pattern"]),
+        "dosage_form": str(row["dosage_form"]),
+        "therapeutic_category": str(row["therapeutic_category"]),
+        "common_daily_life_use_india": str(row["common_daily_life_use_india"]),
+        "common_brand_examples_india": str(row["common_brand_examples_india"]),
+        "availability_context_india": str(row["availability_context_india"]),
+        "otc_or_rx": str(row["otc_or_rx"]),
+        "nlem_or_jan_aushadhi_presence": str(row["nlem_or_jan_aushadhi_presence"]),
+        "india_relevance": str(row["india_relevance"]),
+        "patient_risk_flags_india": str(row["patient_risk_flags_india"]),
+        "source_basis": str(row["source_basis"]),
+        "source_urls": str(row["source_urls"]),
+        "dataset_note": str(row["dataset_note"]),
     }
 
 

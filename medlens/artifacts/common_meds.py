@@ -1172,6 +1172,14 @@ sotalol
 streptomycin
 sulfamethoxazole
 tedizolid
+aluminium magnesium hydroxide
+calcium citrate
+cilnidipine
+febuxostat
+formoterol
+methylcobalamin
+pitavastatin
+teneligliptin
 tilidine
 tolbutamide
 tolterodine
@@ -1184,11 +1192,12 @@ zolmitriptan
 
 
 DDI_ALIAS_SUPPLEMENT: dict[str, tuple[str, ...]] = {
-    "aspirin": ("aspirin low dose", "low dose aspirin"),
+    "aspirin": ("aspirin high dose", "aspirin low dose", "low dose aspirin"),
+    "cholecalciferol": ("vitamin d3", "vitamin d3 cholecalciferol"),
     "cyclosporine": ("ciclosporin",),
     "fluorouracil": ("5 fluorouracil", "5-fluorouracil"),
     "furosemide": ("frusemide",),
-    "insulin": ("insulin nph", "nph insulin"),
+    "insulin": ("insulin nph", "nph insulin", "insulin regular", "regular insulin", "insulin human regular", "human regular insulin"),
     "oral contraceptive": ("combined oral contraceptive pill", "combined oral contraceptive"),
     "sulfamethoxazole trimethoprim": ("co trimoxazole", "cotrimoxazole"),
     "valproate": ("sodium valproate", "valproate sodium"),
