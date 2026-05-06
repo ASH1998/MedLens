@@ -28,6 +28,7 @@ KNOWN_TEMPLATE_MED_TERMS = (
     "advil",
     "warfarin",
     "dolo 650",
+    "captopril",
 )
 
 
@@ -50,6 +51,8 @@ What to actually say:
 
 Hard evidence rules (these are non-negotiable):
 - Use the MedLens tool output as your only source. Do not invent interactions, effects, mechanisms, severities, or sources.
+- Use normalization.sqlite-backed tools for medicine names, aliases, OCR recovery, brand/common medicine profiles, strengths/forms, India common-use context, and common medicine search.
+- Use evidence.sqlite-backed tools for DDI pairs, effects, severity, mechanisms, raw signals, evidence source coverage, and import issues.
 - Severity, top effects, regions, source basis, and source URLs must come straight from the tool result for that pair.
 - Do not reference a pair, severity, effect, or source that did not appear in a tool result this turn.
 - Citations are required. For every matched finding you discuss, end the answer with a short "Sources" section listing every source_urls entry the tool returned for that pair (one URL per line, plus regions and source_bases when present). Do not omit URLs that are in the tool result. If the tool returned no URL, say "no URL on file" instead of staying silent.
@@ -129,27 +132,24 @@ class TemplateProvider:
         findings = report["findings"]
         unresolved = report["unresolved_medications"]
 
-        lines = [
-            f"Checked {report['checked_pair_count']} pair(s) against the local DDI evidence.",
-            f"Overall local evidence severity: {report['overall_severity']}.",
-        ]
+        lines = [f"Overall local evidence severity: {report['overall_severity']}."]
         if findings:
-            lines.append("Here is what stood out:")
+            lines.append("Here is what I would pay attention to:")
             for finding in findings:
                 effects = ", ".join(effect["adverse_effect"] for effect in finding.get("effects", [])[:3])
-                suffix = f" Watch for: {effects}." if effects else ""
+                suffix = f" The main things to watch for are {effects}." if effects else ""
                 lines.append(
-                    f"- {finding['drug_a']} + {finding['drug_b']} ({finding['severity']}, "
-                    f"{finding['row_count']} supporting rows).{suffix}"
+                    f"- {finding['drug_a']} + {finding['drug_b']} is a {finding['severity']} finding.{suffix}"
                 )
         else:
-            lines.append("No flagged interaction in the local DDI evidence for these pairs.")
+            lines.append("I did not find a flagged interaction for these medicines in the local evidence.")
 
         if unresolved:
             names = ", ".join(item["input_name"] for item in unresolved)
-            lines.append(f"I couldn't match these locally, so I didn't check them: {names}.")
+            lines.append(f"I couldn't match these locally, so I did not check them: {names}.")
 
-        lines.append("This is a local screening output - bring anything Major up with your prescriber or pharmacist before changing meds.")
+        if findings:
+            lines.append("For a Major finding, it is worth asking a pharmacist or prescriber before combining these.")
         return "\n".join(lines)
 
     def generate_with_tools(
@@ -165,6 +165,61 @@ class TemplateProvider:
         called_tools = {str(item.get("name", "")) for item in tool_results}
 
         pending_unresolved = _pending_unresolved_from_transcript(messages)
+        interaction_list_drug = _interaction_list_drug_candidate(last_user)
+        if interaction_list_drug and "list_interactions_for_drug" not in called_tools:
+            return ToolModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="template-drug-interactions-1",
+                        name="list_interactions_for_drug",
+                        args={"drug": interaction_list_drug, "limit": 12},
+                    ),
+                ),
+            )
+        interaction_list_result = _last_tool_result(tool_results, "list_interactions_for_drug")
+        if interaction_list_result:
+            return ToolModelResponse(text=_response_from_drug_interactions(interaction_list_result))
+
+        if _evidence_sources_intent(last_user) and "list_evidence_sources" not in called_tools:
+            return ToolModelResponse(text="", tool_calls=(ToolCall(id="template-evidence-sources-1", name="list_evidence_sources", args={}),))
+        evidence_sources_result = _last_tool_result(tool_results, "list_evidence_sources")
+        if evidence_sources_result:
+            return ToolModelResponse(text=_response_from_evidence_sources(evidence_sources_result))
+
+        import_issue_query = _import_issue_query(last_user)
+        if import_issue_query is not None and "list_import_issues" not in called_tools:
+            return ToolModelResponse(
+                text="",
+                tool_calls=(ToolCall(id="template-import-issues-1", name="list_import_issues", args={"query": import_issue_query, "limit": 10}),),
+            )
+        import_issues_result = _last_tool_result(tool_results, "list_import_issues")
+        if import_issues_result:
+            return ToolModelResponse(text=_response_from_import_issues(import_issues_result))
+
+        common_profile_names = _common_profile_candidates(last_user)
+        if common_profile_names and not _called_common_profiles(tool_results, common_profile_names):
+            return ToolModelResponse(
+                text="",
+                tool_calls=tuple(
+                    ToolCall(id=f"template-common-profile-{index}", name="get_common_medicine_profile", args={"name": name, "limit": 3})
+                    for index, name in enumerate(common_profile_names[:3], start=1)
+                ),
+            )
+        common_profile_results = _all_tool_results(tool_results, "get_common_medicine_profile")
+        if common_profile_results:
+            return ToolModelResponse(text=_response_from_common_profiles(common_profile_results))
+
+        common_search_query = _common_search_query(last_user)
+        if common_search_query and "search_common_medicines" not in called_tools:
+            return ToolModelResponse(
+                text="",
+                tool_calls=(ToolCall(id="template-common-search-1", name="search_common_medicines", args={"query": common_search_query, "limit": 8}),),
+            )
+        common_search_result = _last_tool_result(tool_results, "search_common_medicines")
+        if common_search_result:
+            return ToolModelResponse(text=_response_from_common_search(common_search_result))
+
         candidates = _candidate_medications(last_user) or _extract_medication_candidates(last_user)
         followup_candidates = _extract_followup_medication_candidate(last_user, pending_unresolved)
         if followup_candidates:
@@ -599,7 +654,7 @@ def _extract_medication_candidates(user_text: str) -> list[str]:
     if "," not in first_line and not any(token in normalized for token in ("take", "taking", "med", "medicine", "along with", "with")):
         return []
     text = re.sub(
-        r"\b(i|am|i'm|im|taking|take|the|a|an|tablet|tablets|capsule|capsules|medicine|medicines|meds?|my)\b",
+        r"\b(i|am|i'm|im|what|which|cant|can't|cannot|be|taking|taken|take|avoid|interact|interacts|interactions|can|could|should|is|are|ok|okay|safe|together|the|a|an|tablet|tablets|capsule|capsules|drug|drugs|medicine|medicines|meds?|my)\b",
         " ",
         first_line,
         flags=re.IGNORECASE,
@@ -607,7 +662,12 @@ def _extract_medication_candidates(user_text: str) -> list[str]:
     pieces = re.split(r"[,;/]|\s+\band\b\s+|\s+\bwith\b\s+|\s+\balong\s+with\b\s+", text, flags=re.IGNORECASE)
     candidates: list[str] = []
     for piece in pieces:
+        piece = re.split(r"[.?!]", piece, maxsplit=1)[0]
         value = " ".join(re.findall(r"[A-Za-z0-9]+", piece)).strip()
+        known = _known_terms_in_text(value)
+        if known:
+            candidates.extend(known)
+            continue
         if len(value) >= 3 and value.casefold() not in {"what should watch for", "watch for"}:
             candidates.append(value)
     if len(candidates) == 1:
@@ -615,6 +675,115 @@ def _extract_medication_candidates(user_text: str) -> list[str]:
         if len(known) >= 2:
             return known
     return candidates
+
+
+def _interaction_list_drug_candidate(user_text: str) -> str:
+    first_line = user_text.splitlines()[0] if user_text.splitlines() else user_text
+    normalized = first_line.casefold()
+    intent_terms = (
+        "what medicines",
+        "which medicines",
+        "what drugs",
+        "which drugs",
+        "can't be taken",
+        "cant be taken",
+        "cannot be taken",
+        "should i avoid",
+        "interact with",
+        "interacts with",
+    )
+    if not any(term in normalized for term in intent_terms):
+        return ""
+    for pattern in (
+        r"\b(?:with|against|for)\s+([A-Za-z][A-Za-z0-9 -]{1,60})",
+        r"\b(?:avoid|taking|taken)\s+([A-Za-z][A-Za-z0-9 -]{1,60})",
+    ):
+        match = re.search(pattern, first_line, flags=re.IGNORECASE)
+        if match:
+            candidate = re.split(r"[.?!,;]", match.group(1), maxsplit=1)[0]
+            candidate = " ".join(re.findall(r"[A-Za-z0-9]+", candidate)).strip()
+            if len(candidate) >= 3:
+                return candidate
+    known = _known_terms_in_text(first_line)
+    return known[0] if known else ""
+
+
+def _evidence_sources_intent(user_text: str) -> bool:
+    normalized = user_text.casefold()
+    return any(
+        phrase in normalized
+        for phrase in (
+            "evidence sources",
+            "data sources",
+            "source files",
+            "which datasets",
+            "what datasets",
+            "import counts",
+            "rows imported",
+        )
+    )
+
+
+def _import_issue_query(user_text: str) -> str | None:
+    normalized = user_text.casefold()
+    if not any(phrase in normalized for phrase in ("import issue", "import issues", "unresolved import", "unresolved rows", "failed to import", "normalization gaps")):
+        return None
+    for pattern in (r"\b(?:for|about|with)\s+([A-Za-z][A-Za-z0-9 -]{1,60})",):
+        match = re.search(pattern, user_text, flags=re.IGNORECASE)
+        if match:
+            candidate = re.split(r"[.?!,;]", match.group(1), maxsplit=1)[0]
+            return " ".join(re.findall(r"[A-Za-z0-9]+", candidate)).strip()
+    return ""
+
+
+def _common_profile_candidates(user_text: str) -> list[str]:
+    first_line = user_text.splitlines()[0] if user_text.splitlines() else user_text
+    normalized = first_line.casefold()
+    profile_terms = (
+        "what is",
+        "what are",
+        "what's",
+        "whats",
+        "profile",
+        "composition",
+        "strength",
+        "dosage",
+        "brand",
+        "otc",
+        "rx",
+        "used for",
+        "use of",
+    )
+    if not any(term in normalized for term in profile_terms):
+        return []
+    candidates = _candidate_medications(user_text) or _extract_medication_candidates(user_text)
+    if candidates:
+        return list(dict.fromkeys(candidates))
+    for pattern in (
+        r"\b(?:what is|what are|what's|whats|profile for|about|composition of|strength of|use of)\s+([A-Za-z][A-Za-z0-9 +/.-]{1,80})",
+        r"\b(?:is|are)\s+([A-Za-z][A-Za-z0-9 +/.-]{1,80})\s+(?:otc|rx|prescription|used)",
+    ):
+        match = re.search(pattern, first_line, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = re.split(r"[.?!;]", match.group(1), maxsplit=1)[0]
+        candidate = re.sub(r"\b(used for|useful for|medicine|tablet|capsule|brand|generic)\b.*$", " ", candidate, flags=re.IGNORECASE)
+        value = " ".join(re.findall(r"[A-Za-z0-9]+", candidate)).strip()
+        if len(value) >= 3 and value.casefold() not in {"these", "this medicine", "this"}:
+            return [value]
+    return []
+
+
+def _common_search_query(user_text: str) -> str:
+    first_line = user_text.splitlines()[0] if user_text.splitlines() else user_text
+    normalized = first_line.casefold()
+    if not any(phrase in normalized for phrase in ("common medicines for", "medicines for", "medicine for", "drugs for", "search common")):
+        return ""
+    match = re.search(r"\b(?:for|search common)\s+([A-Za-z][A-Za-z0-9 -]{1,80})", first_line, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    candidate = re.split(r"[.?!,;]", match.group(1), maxsplit=1)[0]
+    return " ".join(re.findall(r"[A-Za-z0-9]+", candidate)).strip()
 
 
 def _known_terms_in_text(value: str) -> list[str]:
@@ -746,63 +915,289 @@ def _last_tool_result(tool_results: list[dict[str, object]], name: str) -> dict[
     return None
 
 
+def _all_tool_results(tool_results: list[dict[str, object]], name: str) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    for message in tool_results:
+        if message.get("name") != name:
+            continue
+        content = message.get("content")
+        if isinstance(content, dict):
+            results.append(content)
+    return results
+
+
+def _called_common_profiles(tool_results: list[dict[str, object]], names: list[str]) -> bool:
+    return sum(1 for message in tool_results if message.get("name") == "get_common_medicine_profile") >= min(len(names), 3)
+
+
 def _response_from_report(report: dict[str, object]) -> str:
     findings = report.get("findings", [])
     unresolved = report.get("unresolved_medications", [])
     checked_pair_count = report.get("checked_pair_count", 0)
     overall = report.get("overall_severity", "None")
-    lines = [
-        f"Checked {checked_pair_count} pair(s) in the local DDI evidence. Overall severity: {overall}.",
-    ]
+    lines = [f"I checked {_pair_count_text(checked_pair_count)}. In my local reference set, this is marked {overall}."]
     if isinstance(findings, list) and findings:
-        for finding in findings[:3]:
-            if not isinstance(finding, dict):
-                continue
-            effects = finding.get("effects", [])
-            effect_names: list[str] = []
-            if isinstance(effects, list):
-                effect_names = [str(effect.get("adverse_effect")) for effect in effects[:2] if isinstance(effect, dict)]
-            suffix = f" - watch for {', '.join(effect_names)}" if effect_names else ""
-            source_line = _source_line_from_finding(finding)
-            source_suffix = f" Source: {source_line}." if source_line else ""
-            lines.append(
-                f"- {finding.get('drug_a')} + {finding.get('drug_b')} "
-                f"({finding.get('severity')}, {finding.get('row_count')} rows{_regions_suffix(finding)}){suffix}.{source_suffix}"
-            )
+        first_finding = next((item for item in findings if isinstance(item, dict)), None)
+        if first_finding is not None:
+            lines.extend(_finding_explanation_lines(first_finding))
+            source_lines = _source_lines_from_finding(first_finding)
+            if source_lines:
+                lines.append("")
+                lines.append("Sources:")
+                lines.extend(source_lines)
+            else:
+                lines.append("")
+                lines.append("Sources:")
+                lines.append(f"- {first_finding.get('drug_a')} + {first_finding.get('drug_b')}: no URL on file")
         if len(findings) > 3:
-            lines.append(f"- {len(findings) - 3} more findings available. Ask for details to see them all.")
-        else:
-            lines.append("Ask for details if you want mechanisms, raw signal rows, or what to discuss with your prescriber.")
+            lines.append("")
+            lines.append(f"There are {len(findings) - 3} more findings available. Ask for details and I can walk through them.")
+        elif len(findings) > 1:
+            lines.append("")
+            lines.append(f"There are {len(findings) - 1} more findings available. Ask for details and I can walk through them.")
     else:
-        lines.append("No flagged interaction in the local DDI evidence for these pairs.")
-        lines.append("Ask for details if you want me to walk through what I checked or look up something specific.")
+        lines.append("I did not find a flagged interaction for these medicines in the local evidence. That does not prove the combination is safe; it only means this local reference set did not flag it.")
+        lines.append("If you have symptoms or a condition that changes risk, a pharmacist can help interpret it.")
 
     if isinstance(unresolved, list) and unresolved:
         names = ", ".join(str(item.get("input_name")) for item in unresolved if isinstance(item, dict))
-        lines.append(f"Couldn't match locally, so I didn't check: {names}.")
+        lines.append(f"I could not match this locally, so I did not check it: {names}.")
 
     return "\n".join(lines)
 
 
-def _source_line_from_finding(finding: dict[str, object]) -> str:
+def _response_from_drug_interactions(result: dict[str, object]) -> str:
+    drug = result.get("drug")
+    canonical = ""
+    resolved = False
+    if isinstance(drug, dict):
+        canonical = str(drug.get("canonical_name") or drug.get("input_name") or drug.get("input") or "")
+        resolved = bool(drug.get("resolved"))
+    if not resolved:
+        name = canonical or "that medicine"
+        return f"I could not match {name} in the local medicine index, so I cannot list interaction partners for it yet."
+
+    interactions = result.get("interactions", [])
+    if not isinstance(interactions, list) or not interactions:
+        return (
+            f"I did not find locally flagged interaction partners for {canonical}. "
+            "That does not prove every combination is safe; it only means this local reference set did not flag any."
+        )
+
+    shown = [item for item in interactions[:8] if isinstance(item, dict)]
+    lines = [
+        f"I am showing {len(interactions)} locally flagged medicine(s) for {canonical}.",
+        "This is not a universal do-not-take list; it is a list of combinations worth checking with a pharmacist or prescriber.",
+        "",
+        "Highest-priority matches:",
+    ]
+    for item in shown:
+        partner = str(item.get("partner") or "unknown medicine")
+        severity = str(item.get("severity") or "flagged")
+        effects = _effect_names_from_interaction_item(item, 2)
+        effect_text = f" Main concern: {', '.join(effects)}." if effects else ""
+        lines.append(f"- {partner}: {severity}.{effect_text}")
+    if len(interactions) > len(shown):
+        lines.append(f"- {len(interactions) - len(shown)} more locally flagged match(es) available.")
+
+    source_lines = _source_lines_from_interaction_items(shown[:3])
+    if source_lines:
+        lines.append("")
+        lines.append("Sources:")
+        lines.extend(source_lines)
+    return "\n".join(lines)
+
+
+def _response_from_common_profiles(results: list[dict[str, object]]) -> str:
+    lines: list[str] = []
+    for result in results:
+        normalized = result.get("normalized", {})
+        canonical = ""
+        if isinstance(normalized, dict):
+            canonical = str(normalized.get("canonical_name") or normalized.get("input_name") or normalized.get("input") or "")
+        matches = result.get("matches", [])
+        if not isinstance(matches, list) or not matches:
+            query = str(result.get("query") or canonical or "that medicine")
+            lines.append(f"I could not find an India common-medicine profile for {query} in the local normalization database.")
+            continue
+        first = next((item for item in matches if isinstance(item, dict)), None)
+        if first is None:
+            continue
+        name = canonical or str(first.get("canonical_name") or first.get("generic_or_common_name") or "this medicine")
+        common = str(first.get("generic_or_common_name") or name)
+        lines.append(f"{common} maps locally to {name}.")
+        use = str(first.get("common_daily_life_use_india") or "")
+        if use:
+            lines.append(f"Common India use context: {use}.")
+        form = str(first.get("dosage_form") or "")
+        strength = str(first.get("composition_or_strength_pattern") or "")
+        if form or strength:
+            lines.append(f"Forms/strengths in the local catalogue: {', '.join(part for part in (form, strength) if part)}.")
+        brands = str(first.get("common_brand_examples_india") or "")
+        if brands:
+            lines.append(f"Brand examples in the dataset: {brands}.")
+        rx = str(first.get("otc_or_rx") or "")
+        if rx:
+            lines.append(f"Availability context: {rx}.")
+        flags = str(first.get("patient_risk_flags_india") or "")
+        if flags:
+            lines.append(f"Risk flags to notice: {flags}.")
+        urls = str(first.get("source_urls") or "")
+        if urls:
+            lines.append("Sources: " + urls)
+        if len(results) > 1:
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _response_from_common_search(result: dict[str, object]) -> str:
+    query = str(result.get("query") or "that search")
+    matches = result.get("matches", [])
+    if not isinstance(matches, list) or not matches:
+        return f"I did not find common India medicine catalogue matches for {query}."
+    lines = [f"I found {len(matches)} common India medicine catalogue match(es) for {query}:"]
+    for item in matches[:8]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("generic_or_common_name") or item.get("canonical_name") or "medicine")
+        category = str(item.get("therapeutic_category") or "")
+        brands = str(item.get("common_brand_examples_india") or "")
+        use = str(item.get("common_daily_life_use_india") or "")
+        detail = "; ".join(part for part in (category, use, f"brands: {brands}" if brands else "") if part)
+        lines.append(f"- {name}: {detail}")
+    return "\n".join(lines)
+
+
+def _response_from_evidence_sources(result: dict[str, object]) -> str:
+    sources = result.get("sources", [])
+    if not isinstance(sources, list) or not sources:
+        return "I did not find source-file import records in the local evidence database."
+    lines = ["The local evidence database currently has these source files loaded:"]
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        lines.append(
+            "- {source_file}: {rows_imported}/{rows_seen} rows imported, {rows_unresolved} unresolved, {unique_pairs_imported} unique pairs ({region}).".format(
+                source_file=item.get("source_file"),
+                rows_imported=item.get("rows_imported"),
+                rows_seen=item.get("rows_seen"),
+                rows_unresolved=item.get("rows_unresolved"),
+                unique_pairs_imported=item.get("unique_pairs_imported"),
+                region=item.get("region"),
+            )
+        )
+    return "\n".join(lines)
+
+
+def _response_from_import_issues(result: dict[str, object]) -> str:
+    issues = result.get("issues", [])
+    if not isinstance(issues, list) or not issues:
+        return "I did not find unresolved import issues for that query in the local evidence database."
+    lines = [f"I found {len(issues)} unresolved import issue(s) in the local evidence database:"]
+    for item in issues[:10]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(
+            "- {source_file} row {row_number}: {drug1} + {drug2} ({reason}).".format(
+                source_file=item.get("source_file"),
+                row_number=item.get("row_number"),
+                drug1=item.get("drug1"),
+                drug2=item.get("drug2"),
+                reason=item.get("reason"),
+            )
+        )
+    return "\n".join(lines)
+
+
+def _effect_names_from_interaction_item(item: dict[str, object], limit: int) -> list[str]:
+    effects = item.get("top_effects", [])
+    if not isinstance(effects, list):
+        return []
+    names: list[str] = []
+    for effect in effects[:limit]:
+        if isinstance(effect, dict) and effect.get("adverse_effect"):
+            names.append(str(effect["adverse_effect"]))
+    return names
+
+
+def _source_lines_from_interaction_items(items: list[dict[str, object]]) -> list[str]:
+    lines: list[str] = []
+    for item in items:
+        drug_a = str(item.get("drug_a") or "medicine A")
+        drug_b = str(item.get("drug_b") or "medicine B")
+        urls = item.get("source_urls", [])
+        if isinstance(urls, list) and urls:
+            lines.append(f"- {drug_a} + {drug_b}: {urls[0]}")
+        else:
+            lines.append(f"- {drug_a} + {drug_b}: no URL on file")
+    return lines
+
+
+def _finding_explanation_lines(finding: dict[str, object]) -> list[str]:
+    drug_a = str(finding.get("drug_a") or "medicine A")
+    drug_b = str(finding.get("drug_b") or "medicine B")
+    severity = str(finding.get("severity") or "flagged")
+    effects = _effect_names_from_finding(finding, 3)
+
+    lines = [f"I found a {severity} interaction between {drug_a} and {drug_b}."]
+    if effects:
+        lines.append(f"The main concern is {', '.join(effects)}.")
+        plain_note = _plain_effect_note(effects[0])
+        if plain_note:
+            lines.append(plain_note)
+    if severity == "Major":
+        lines.append(
+            "Because this is marked Major, it is worth asking a pharmacist or prescriber before using them together."
+        )
+    elif effects:
+        lines.append("If you are using them together, keep an eye on those symptoms and ask a pharmacist if they show up.")
+    return lines
+
+
+def _effect_names_from_finding(finding: dict[str, object], limit: int) -> list[str]:
+    effects = finding.get("effects", [])
+    if not isinstance(effects, list):
+        return []
+    names: list[str] = []
+    for effect in effects[:limit]:
+        if isinstance(effect, dict) and effect.get("adverse_effect"):
+            names.append(str(effect["adverse_effect"]))
+    return names
+
+
+def _plain_effect_note(effect_name: str) -> str:
+    normalized = effect_name.casefold()
+    if "gastrointestinal bleeding" in normalized:
+        return "In plain language, gastrointestinal bleeding means bleeding in the stomach or intestines."
+    if "intracranial hemorrhage" in normalized:
+        return "In plain language, intracranial hemorrhage means bleeding inside the skull."
+    if "qt prolongation" in normalized:
+        return "In plain language, QT prolongation is an electrical heart-rhythm change that can become dangerous in some people."
+    if "torsades" in normalized:
+        return "In plain language, torsades de pointes is a dangerous abnormal heart rhythm."
+    if "acute anemia" in normalized:
+        return "In plain language, acute anemia means a sudden drop in red blood cells or hemoglobin."
+    return ""
+
+
+def _source_lines_from_finding(finding: dict[str, object]) -> list[str]:
+    drug_a = str(finding.get("drug_a") or "medicine A")
+    drug_b = str(finding.get("drug_b") or "medicine B")
     regions = _short_list(finding.get("source_regions"), 4)
-    bases = _short_list(finding.get("source_bases"), 3)
-    urls = _short_list(finding.get("source_urls"), 4)
-    parts: list[str] = []
+    bases = _compact_basis_items(finding.get("source_bases"), 3)
+    urls = _short_list(finding.get("source_urls"), 20)
+    if not urls:
+        return []
+    meta_parts: list[str] = []
     if regions:
-        parts.append("regions: " + ", ".join(regions))
+        meta_parts.append("regions: " + ", ".join(regions))
     if bases:
-        parts.append("basis: " + "; ".join(bases))
-    if urls:
-        parts.append("urls: " + " | ".join(urls))
-    return "; ".join(parts)
-
-
-def _regions_suffix(finding: dict[str, object]) -> str:
-    regions = _short_list(finding.get("source_regions"), 4)
-    if not regions:
-        return ""
-    return f", regions: {', '.join(regions)}"
+        meta_parts.append("basis: " + "; ".join(bases))
+    meta = f" ({'; '.join(meta_parts)})" if meta_parts else ""
+    lines = [f"- {drug_a} + {drug_b}: {url}{meta}" for url in urls[:3]]
+    if len(urls) > 3:
+        lines.append(f"- {drug_a} + {drug_b}: {len(urls) - 3} more source URL(s) on file; use /sources for the full list.")
+    return lines
 
 
 def _short_list(value: object, limit: int) -> list[str]:
@@ -811,11 +1206,34 @@ def _short_list(value: object, limit: int) -> list[str]:
     return [str(item) for item in value[:limit] if str(item)]
 
 
+def _compact_basis_items(value: object, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for raw in value:
+        for piece in str(raw).split(";"):
+            item = piece.strip()
+            if item and item not in items:
+                items.append(item)
+            if len(items) >= limit:
+                return items
+    return items
+
+
+def _pair_count_text(value: object) -> str:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = 0
+    noun = "medicine pair" if count == 1 else "medicine pairs"
+    return f"{count} {noun}"
+
+
 def _educational_fallback_text() -> str:
     return (
-        "I focus on medication interactions, so I'm not the right tool for diagnosing symptoms or recommending treatment. "
-        "A pharmacist or clinician can help with that. For red-flag symptoms - chest pain, trouble breathing, "
-        "heavy bleeding, or sudden weakness - go straight to urgent care."
+        "I can help with medication interaction questions, but I am not the right tool for diagnosing symptoms or choosing a treatment. "
+        "A pharmacist or clinician can help connect symptoms with your own health history and medicines. If there is chest pain, trouble "
+        "breathing, heavy bleeding, sudden weakness, or severe allergic symptoms, seek urgent care."
     )
 
 

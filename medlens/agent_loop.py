@@ -19,10 +19,17 @@ TOOL_LOOP_SYSTEM_PROMPT = (
 How to use the local SQLite tools:
 - You are a real agent. Run the tools - don't guess. The tools are the source of truth for every factual claim about a medication, pair, severity, effect, mechanism, region, or source URL.
 - When the user lists medications, call normalize_medications first with their exact wording.
-- For names that don't normalize, call search_drug_aliases on each unresolved string. If the alias search returns a confident match, use it - you don't always need to ask the user.
+- For names that don't normalize, call search_drug_aliases on each unresolved string. If the alias search returns a confident match, use it - you don't always need to ask the user. If the user is asking what a brand/common medicine is, or asks about use, strength, formulation, OTC/Rx status, India relevance, or local risk flags, call get_common_medicine_profile or search_common_medicines from normalization.sqlite.
 - Once you have clean names, call add_medications, then build_structured_report. Read the report carefully and report the real findings (top effects, mechanism, regions, source_basis, source_urls) in your reply.
-- For a single specific pair the user asks about, lookup_pair, get_pair_effects, severity_consensus, and get_raw_signals are the right tools. Use them.
+- When the user asks broad anchored questions like "what medicines interact with X" or "what can't be taken with X", call list_interactions_for_drug. Use its min_severity, region, and risk_flag filters when the user asks for major-only, India/US/EU-specific, kidney/pregnancy/liver-risk, or similar filtered lists. Make clear that this is a locally flagged interaction list, not a universal do-not-take list.
+- When the user asks global DDI questions that are not anchored to their current medication list - for example "what interactions cause hyperkalemia?", "show major India interactions", or "find bleeding interactions" - call search_interactions with the relevant effect, min_severity, region, risk_flag, or drug filter.
+- When the user asks about a mechanism/category text such as CYP inhibition, QT prolongation mechanism, additive bleeding, renal perfusion, or similar source wording, call search_interactions_by_mechanism. Treat mechanism results as noisy source-text hints, not a clean ontology.
+- When the user asks whether one or more new candidate medicines are safe to add against the current medication list, call bulk_check_pairs. Use an explicit against list if the user provides one; otherwise use the current session medications.
+- For a single specific pair the user asks about, lookup_pair, get_pair_effects, severity_consensus, and get_raw_signals are the right tools. Use get_full_raw_signals when the user asks to audit, debug, inspect raw rows, see source rows, or understand exactly where a claim came from.
 - Pull mechanism and source URLs from the raw signals when they're available - that's exactly the kind of detail that makes the answer feel like an expert pharmacist instead of a checklist.
+- When the user asks "what brands/aliases map to this drug?" call list_aliases_for_drug. When the user asks to browse drug categories or list drugs in a category, call list_drugs_by_category.
+- For dataset/artifact questions, call list_evidence_sources to summarize source-file coverage. Call list_import_issues when the user asks what failed to import, what normalization gaps remain, or why row counts are unresolved.
+- Always choose the database-backed tool that matches the question: normalization.sqlite for aliases, OCR recovery, brand/common medicine profiles, and common medicine search; evidence.sqlite for DDI pairs, effects, raw signals, evidence sources, and import issues.
 
 Length and depth:
 - Match the user's question. If they listed two drugs and walked away, a focused 4-8 sentence answer with the real interaction, why it matters, and what they should know is right.
@@ -216,37 +223,95 @@ def _text_transcript(messages: list[dict[str, object]]) -> list[dict[str, object
 
 def _deterministic_text_from_report(report: MedicationSafetyReport) -> str:
     lines = [
-        f"Checked {report.checked_pair_count} pair(s) in the local DDI evidence. Overall severity: {report.overall_severity}.",
+        f"I checked {_pair_count_text(report.checked_pair_count)}. In my local reference set, this is marked {report.overall_severity}.",
     ]
     if report.findings:
         for finding in report.findings[:3]:
-            effects = ", ".join(effect.adverse_effect for effect in finding.effects[:2])
-            suffix = f" - watch for {effects}" if effects else ""
-            regions = f", regions: {', '.join(finding.source_regions[:4])}" if finding.source_regions else ""
-            source_line = _source_line_from_finding(finding)
-            source_suffix = f" Source: {source_line}." if source_line else ""
-            lines.append(f"- {finding.drug_a} + {finding.drug_b} ({finding.severity}, {finding.row_count} rows{regions}){suffix}.{source_suffix}")
+            lines.extend(_deterministic_finding_lines(finding))
+            lines.append("")
+            lines.append("Sources:")
+            source_lines = _source_lines_from_finding(finding)
+            lines.extend(source_lines or [f"- {finding.drug_a} + {finding.drug_b}: no URL on file"])
         if len(report.findings) > 3:
-            lines.append(f"- {len(report.findings) - 3} more findings available. Ask for details to see them all.")
+            lines.append("")
+            lines.append(f"There are {len(report.findings) - 3} more findings available. Ask for details and I can walk through them.")
         else:
-            lines.append("Ask for details if you want the mechanism, raw signal rows, or what to bring up with your prescriber.")
+            lines.append("")
+            lines.append("Ask for details if you want the mechanism or raw signal rows.")
     else:
-        lines.append("No flagged interaction in the local DDI evidence for these pairs.")
+        lines.append("I did not find a flagged interaction for these medicines in the local evidence. That does not prove the combination is safe; it only means this local reference set did not flag it.")
     if report.unresolved_medications:
         names = ", ".join(item.input_name for item in report.unresolved_medications)
-        lines.append(f"Couldn't match locally, so I didn't check: {names}.")
+        lines.append(f"I could not match this locally, so I did not check it: {names}.")
     return "\n".join(lines)
 
 
-def _source_line_from_finding(finding: object) -> str:
+def _deterministic_finding_lines(finding: object) -> list[str]:
+    drug_a = str(getattr(finding, "drug_a", "medicine A"))
+    drug_b = str(getattr(finding, "drug_b", "medicine B"))
+    severity = str(getattr(finding, "severity", "flagged"))
+    effects = [effect.adverse_effect for effect in getattr(finding, "effects", ())[:3]]
+
+    lines = [f"I found a {severity} interaction between {drug_a} and {drug_b}."]
+    if effects:
+        lines.append(f"The main concern is {', '.join(effects)}.")
+        plain_note = _plain_effect_note(effects[0])
+        if plain_note:
+            lines.append(plain_note)
+    if severity == "Major":
+        lines.append("Because this is marked Major, it is worth asking a pharmacist or prescriber before using them together.")
+    elif effects:
+        lines.append("If you are using them together, keep an eye on those symptoms and ask a pharmacist if they show up.")
+    return lines
+
+
+def _source_lines_from_finding(finding: object) -> list[str]:
+    drug_a = str(getattr(finding, "drug_a", "medicine A"))
+    drug_b = str(getattr(finding, "drug_b", "medicine B"))
     regions = list(getattr(finding, "source_regions", ())[:4])
-    bases = list(getattr(finding, "source_bases", ())[:3])
-    urls = list(getattr(finding, "source_urls", ())[:4])
-    parts: list[str] = []
+    bases = _compact_basis_items(getattr(finding, "source_bases", ()), 3)
+    urls = list(getattr(finding, "source_urls", ())[:20])
+    if not urls:
+        return []
+    meta_parts: list[str] = []
     if regions:
-        parts.append("regions: " + ", ".join(regions))
+        meta_parts.append("regions: " + ", ".join(regions))
     if bases:
-        parts.append("basis: " + "; ".join(bases))
-    if urls:
-        parts.append("urls: " + " | ".join(urls))
-    return "; ".join(parts)
+        meta_parts.append("basis: " + "; ".join(bases))
+    meta = f" ({'; '.join(meta_parts)})" if meta_parts else ""
+    lines = [f"- {drug_a} + {drug_b}: {url}{meta}" for url in urls[:3]]
+    if len(urls) > 3:
+        lines.append(f"- {drug_a} + {drug_b}: {len(urls) - 3} more source URL(s) on file; use /sources for the full list.")
+    return lines
+
+
+def _plain_effect_note(effect_name: str) -> str:
+    normalized = effect_name.casefold()
+    if "gastrointestinal bleeding" in normalized:
+        return "In plain language, gastrointestinal bleeding means bleeding in the stomach or intestines."
+    if "intracranial hemorrhage" in normalized:
+        return "In plain language, intracranial hemorrhage means bleeding inside the skull."
+    if "qt prolongation" in normalized:
+        return "In plain language, QT prolongation is an electrical heart-rhythm change that can become dangerous in some people."
+    if "torsades" in normalized:
+        return "In plain language, torsades de pointes is a dangerous abnormal heart rhythm."
+    if "acute anemia" in normalized:
+        return "In plain language, acute anemia means a sudden drop in red blood cells or hemoglobin."
+    return ""
+
+
+def _compact_basis_items(value: object, limit: int) -> list[str]:
+    items: list[str] = []
+    for raw in value if isinstance(value, tuple) else ():
+        for piece in str(raw).split(";"):
+            item = piece.strip()
+            if item and item not in items:
+                items.append(item)
+            if len(items) >= limit:
+                return items
+    return items
+
+
+def _pair_count_text(count: int) -> str:
+    noun = "medicine pair" if count == 1 else "medicine pairs"
+    return f"{count} {noun}"

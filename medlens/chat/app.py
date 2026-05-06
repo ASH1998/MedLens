@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from medlens.agent import MedicationSafetyAgent
@@ -110,6 +111,8 @@ def _answer(
 
 
 def _prompt(message: str) -> str:
+    if not sys.stdin.isatty():
+        return input(message)
     try:
         from prompt_toolkit import prompt
         from prompt_toolkit.completion import WordCompleter
