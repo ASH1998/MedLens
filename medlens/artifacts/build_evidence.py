@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -508,13 +509,220 @@ def build_evidence_db(input_dir: Path, normalization_db: Path, output: Path) -> 
     write_evidence_db(output, pairs, issues, file_stats, raw_signals)
 
 
+def compact_evidence_db(source: Path, output: Path) -> None:
+    """Create a mobile-sized evidence DB while preserving raw signal rows.
+
+    The compact artifact stores repeated raw-signal text once in a dictionary and
+    exposes the original ``ddi_raw_signal`` shape as a read-only view. This keeps
+    source URLs and raw evidence available without repeating the same long text on
+    every row.
+    """
+    if not source.exists():
+        raise FileNotFoundError(f"Evidence DB not found: {source}")
+    if source.resolve() == output.resolve():
+        raise ValueError("source and output must be different paths")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        output.unlink()
+    shutil.copyfile(source, output)
+
+    with sqlite3.connect(output) as conn:
+        conn.executescript(
+            """
+            PRAGMA foreign_keys = OFF;
+
+            DROP TABLE IF EXISTS ddi_raw_signal_compact;
+            DROP TABLE IF EXISTS raw_text_value;
+
+            CREATE TABLE raw_text_value(
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL UNIQUE
+            );
+
+            INSERT OR IGNORE INTO raw_text_value(value)
+            SELECT COALESCE(source_file, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(region, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(drug1_raw, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(drug2_raw, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(normalized_drug1, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(normalized_drug2, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(drug_a, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(drug_b, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(adverse_effect, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(severity, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(mechanism_or_rationale, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(interaction_category, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(interaction_direction, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(evidence_basis, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(source_basis, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(source_urls, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(population_relevance, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(patient_risk_flags, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(dataset_type, '') FROM ddi_raw_signal
+            UNION SELECT COALESCE(use_case_note, '') FROM ddi_raw_signal;
+
+            CREATE TABLE ddi_raw_signal_compact(
+                id INTEGER PRIMARY KEY,
+                known_interaction_id INTEGER,
+                source_file_id INTEGER NOT NULL,
+                source_row_number INTEGER NOT NULL,
+                source_signal_id TEXT,
+                region_id INTEGER NOT NULL,
+                drug1_raw_id INTEGER NOT NULL,
+                drug2_raw_id INTEGER NOT NULL,
+                normalized_drug1_id INTEGER NOT NULL,
+                normalized_drug2_id INTEGER NOT NULL,
+                drug_a_id INTEGER NOT NULL,
+                drug_b_id INTEGER NOT NULL,
+                resolved INTEGER NOT NULL,
+                adverse_effect_id INTEGER NOT NULL,
+                severity_id INTEGER NOT NULL,
+                severity_rank INTEGER NOT NULL,
+                mechanism_or_rationale_id INTEGER NOT NULL,
+                interaction_category_id INTEGER NOT NULL,
+                interaction_direction_id INTEGER NOT NULL,
+                evidence_basis_id INTEGER NOT NULL,
+                source_basis_id INTEGER NOT NULL,
+                source_urls_id INTEGER NOT NULL,
+                population_relevance_id INTEGER NOT NULL,
+                patient_risk_flags_id INTEGER NOT NULL,
+                dataset_type_id INTEGER NOT NULL,
+                use_case_note_id INTEGER NOT NULL
+            );
+
+            INSERT INTO ddi_raw_signal_compact
+            SELECT
+                r.id,
+                r.known_interaction_id,
+                sf.id,
+                r.source_row_number,
+                r.source_signal_id,
+                reg.id,
+                d1.id,
+                d2.id,
+                nd1.id,
+                nd2.id,
+                da.id,
+                db.id,
+                r.resolved,
+                ae.id,
+                sev.id,
+                r.severity_rank,
+                mech.id,
+                cat.id,
+                dir.id,
+                eb.id,
+                sb.id,
+                urls.id,
+                pop.id,
+                risk.id,
+                dtype.id,
+                note.id
+            FROM ddi_raw_signal r
+            JOIN raw_text_value sf ON sf.value = COALESCE(r.source_file, '')
+            JOIN raw_text_value reg ON reg.value = COALESCE(r.region, '')
+            JOIN raw_text_value d1 ON d1.value = COALESCE(r.drug1_raw, '')
+            JOIN raw_text_value d2 ON d2.value = COALESCE(r.drug2_raw, '')
+            JOIN raw_text_value nd1 ON nd1.value = COALESCE(r.normalized_drug1, '')
+            JOIN raw_text_value nd2 ON nd2.value = COALESCE(r.normalized_drug2, '')
+            JOIN raw_text_value da ON da.value = COALESCE(r.drug_a, '')
+            JOIN raw_text_value db ON db.value = COALESCE(r.drug_b, '')
+            JOIN raw_text_value ae ON ae.value = COALESCE(r.adverse_effect, '')
+            JOIN raw_text_value sev ON sev.value = COALESCE(r.severity, '')
+            JOIN raw_text_value mech ON mech.value = COALESCE(r.mechanism_or_rationale, '')
+            JOIN raw_text_value cat ON cat.value = COALESCE(r.interaction_category, '')
+            JOIN raw_text_value dir ON dir.value = COALESCE(r.interaction_direction, '')
+            JOIN raw_text_value eb ON eb.value = COALESCE(r.evidence_basis, '')
+            JOIN raw_text_value sb ON sb.value = COALESCE(r.source_basis, '')
+            JOIN raw_text_value urls ON urls.value = COALESCE(r.source_urls, '')
+            JOIN raw_text_value pop ON pop.value = COALESCE(r.population_relevance, '')
+            JOIN raw_text_value risk ON risk.value = COALESCE(r.patient_risk_flags, '')
+            JOIN raw_text_value dtype ON dtype.value = COALESCE(r.dataset_type, '')
+            JOIN raw_text_value note ON note.value = COALESCE(r.use_case_note, '');
+
+            DROP TABLE ddi_raw_signal;
+
+            CREATE VIEW ddi_raw_signal AS
+            SELECT
+                r.id,
+                r.known_interaction_id,
+                sf.value AS source_file,
+                r.source_row_number,
+                r.source_signal_id,
+                reg.value AS region,
+                d1.value AS drug1_raw,
+                d2.value AS drug2_raw,
+                nd1.value AS normalized_drug1,
+                nd2.value AS normalized_drug2,
+                NULLIF(da.value, '') AS drug_a,
+                NULLIF(db.value, '') AS drug_b,
+                r.resolved,
+                NULLIF(ae.value, '') AS adverse_effect,
+                NULLIF(sev.value, '') AS severity,
+                r.severity_rank,
+                NULLIF(mech.value, '') AS mechanism_or_rationale,
+                NULLIF(cat.value, '') AS interaction_category,
+                NULLIF(dir.value, '') AS interaction_direction,
+                NULLIF(eb.value, '') AS evidence_basis,
+                NULLIF(sb.value, '') AS source_basis,
+                NULLIF(urls.value, '') AS source_urls,
+                NULLIF(pop.value, '') AS population_relevance,
+                NULLIF(risk.value, '') AS patient_risk_flags,
+                NULLIF(dtype.value, '') AS dataset_type,
+                NULLIF(note.value, '') AS use_case_note
+            FROM ddi_raw_signal_compact r
+            JOIN raw_text_value sf ON sf.id = r.source_file_id
+            JOIN raw_text_value reg ON reg.id = r.region_id
+            JOIN raw_text_value d1 ON d1.id = r.drug1_raw_id
+            JOIN raw_text_value d2 ON d2.id = r.drug2_raw_id
+            JOIN raw_text_value nd1 ON nd1.id = r.normalized_drug1_id
+            JOIN raw_text_value nd2 ON nd2.id = r.normalized_drug2_id
+            JOIN raw_text_value da ON da.id = r.drug_a_id
+            JOIN raw_text_value db ON db.id = r.drug_b_id
+            JOIN raw_text_value ae ON ae.id = r.adverse_effect_id
+            JOIN raw_text_value sev ON sev.id = r.severity_id
+            JOIN raw_text_value mech ON mech.id = r.mechanism_or_rationale_id
+            JOIN raw_text_value cat ON cat.id = r.interaction_category_id
+            JOIN raw_text_value dir ON dir.id = r.interaction_direction_id
+            JOIN raw_text_value eb ON eb.id = r.evidence_basis_id
+            JOIN raw_text_value sb ON sb.id = r.source_basis_id
+            JOIN raw_text_value urls ON urls.id = r.source_urls_id
+            JOIN raw_text_value pop ON pop.id = r.population_relevance_id
+            JOIN raw_text_value risk ON risk.id = r.patient_risk_flags_id
+            JOIN raw_text_value dtype ON dtype.id = r.dataset_type_id
+            JOIN raw_text_value note ON note.id = r.use_case_note_id;
+
+            CREATE INDEX idx_ddi_raw_signal_interaction ON ddi_raw_signal_compact(known_interaction_id);
+            CREATE INDEX idx_ddi_raw_signal_pair ON ddi_raw_signal_compact(drug_a_id, drug_b_id);
+            CREATE INDEX idx_ddi_raw_signal_resolved ON ddi_raw_signal_compact(resolved);
+
+            VACUUM;
+            ANALYZE;
+            PRAGMA optimize;
+            """
+        )
+
+
 def artifact_stats(output: Path) -> dict[str, int]:
     with sqlite3.connect(output) as conn:
+        relations = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
+        }
         return {
             "known_interactions": int(conn.execute("SELECT COUNT(*) FROM known_interaction").fetchone()[0]),
             "known_interaction_effects": int(conn.execute("SELECT COUNT(*) FROM known_interaction_effect").fetchone()[0]),
-            "ddi_raw_signals": int(conn.execute("SELECT COUNT(*) FROM ddi_raw_signal").fetchone()[0]),
-            "import_issues": int(conn.execute("SELECT COUNT(*) FROM ddi_import_issue").fetchone()[0]),
+            "ddi_raw_signals": (
+                int(conn.execute("SELECT COUNT(*) FROM ddi_raw_signal").fetchone()[0])
+                if "ddi_raw_signal" in relations
+                else 0
+            ),
+            "import_issues": (
+                int(conn.execute("SELECT COUNT(*) FROM ddi_import_issue").fetchone()[0])
+                if "ddi_import_issue" in relations
+                else 0
+            ),
             "source_files": int(conn.execute("SELECT COUNT(*) FROM evidence_import_file").fetchone()[0]),
         }
 
@@ -534,12 +742,20 @@ def parse_args() -> argparse.Namespace:
         default=Path("data/artifacts/evidence.sqlite"),
         help="Output evidence SQLite path.",
     )
+    parser.add_argument(
+        "--compact-from",
+        type=Path,
+        help="Build a mobile compact artifact from an existing evidence DB instead of importing CSVs.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    build_evidence_db(args.input_dir, args.normalization_db, args.output)
+    if args.compact_from:
+        compact_evidence_db(args.compact_from, args.output)
+    else:
+        build_evidence_db(args.input_dir, args.normalization_db, args.output)
     stats = artifact_stats(args.output)
     print(f"Built {args.output}")
     for key, value in stats.items():
