@@ -1042,3 +1042,263 @@ OK
 
 - Generated SQLite artifacts are ignored by git because they are reproducible build outputs.
 - Module 1 focuses on deterministic normalization only. Pair evidence export is intentionally left for Module 2 so we can review and confirm each step.
+
+## Mobile Evidence Artifact
+
+Status: implemented and generated.
+
+Goal:
+
+- Keep the full raw DDI evidence available for phone/PWA runtimes while keeping
+  the queryable SQLite artifact below the 100 MB mobile budget.
+- Preserve source URLs because they are needed for evidence links in the app.
+- Avoid dropping `ddi_raw_signal`; the raw rows contain useful mechanism,
+  rationale, source, regional relevance, risk-flag, and caveat data.
+
+Implementation:
+
+- `medlens/artifacts/build_evidence.py` now supports `--compact-from`.
+- The compact artifact keeps `known_interaction`,
+  `known_interaction_effect`, `ddi_import_issue`, and `evidence_import_file`.
+- Repeated raw-signal text is stored once in `raw_text_value`.
+- Raw rows are stored in `ddi_raw_signal_compact` with integer references into
+  `raw_text_value`.
+- `ddi_raw_signal` remains available as a read-only SQLite view with the same
+  columns as the full artifact, so existing read queries can continue to use
+  `SELECT ... FROM ddi_raw_signal`.
+
+Build:
+
+```bash
+.venv/bin/python -m medlens.artifacts.build_evidence \
+  --compact-from data/artifacts/evidence.sqlite \
+  --output data/artifacts/evidence.mobile.sqlite
+```
+
+Current output:
+
+- `data/artifacts/evidence.sqlite`: about 260 MB.
+- `data/artifacts/evidence.mobile.sqlite`: about 73 MB.
+- `ddi_raw_signal`: 162,600 readable rows preserved.
+- `ddi_import_issue`: 15,696 rows preserved.
+
+Important runtime note:
+
+- In `evidence.mobile.sqlite`, `ddi_raw_signal` is a view, not the physical
+  storage table. Reads work. Writes to `ddi_raw_signal` do not. This is
+  acceptable for the shipped mobile/PWA artifact, which should be read-only.
+
+## PWA Phase 0 — Artifact Access + Storage Preflight
+
+Status: complete (2026-05-07).
+
+Reference: `docs/pwa_plan.md` Phase 0.
+
+Anonymous HEAD against both pinned `resolve/main` URLs from a non-Hugging-Face
+Origin returned 200 after redirect with full CORS support. The PWA download
+path is unblocked.
+
+Captured headers (2026-05-07, dataset commit `b3933aca1510fc8f12fd47a5280da7a0b8c3a88a`):
+
+| Artifact | x-linked-size | Accept-Ranges | x-linked-etag (LFS SHA256) |
+| --- | ---: | --- | --- |
+| `normalization.sqlite` | 7,409,664 (≈7.4 MB) | bytes | `50356a54fb3d6ec131044ddc6b72bad02eea4a7c0682284174de6674e5515d92` |
+| `evidence.mobile.sqlite` | 76,492,800 (≈73 MB) | bytes | `1883368fd0f40906baae189d35bd310a43d651adfe595dcb295ee92fdcdb15aa` |
+
+CORS check: `curl -H "Origin: https://medlens.example.com"` against both URLs
+mirrored the arbitrary Origin back in `Access-Control-Allow-Origin` on both the
+HF redirect and the `cas-bridge.xethub.hf.co` CDN target, with
+`Access-Control-Expose-Headers` including `X-Repo-Commit`, `ETag`,
+`Accept-Ranges`, `Content-Range`. Cross-origin `fetch` from a deployed PWA
+origin will work.
+
+Versioning anchors confirmed available:
+
+- `x-repo-commit` — dataset-change anchor.
+- `x-linked-etag` — LFS object SHA256, used as the content/integrity anchor.
+
+Outstanding Phase 0 items deferred (non-blocking for Phase 1 scaffolding but
+required before Phase 6 UI / Phase 8 release):
+
+- `navigator.storage.persist()` lock-in lands with `FirstRunSetup.tsx` in
+  Phase 6.
+- Play Store medical-app review spike scheduled before Phase 6 UI work.
+
+## PWA Phase 1 — Scaffolding
+
+Status: complete (2026-05-07).
+
+Reference: `docs/pwa_plan.md` Phase 1.
+
+New code lives entirely under `web/`. Nothing in the Python `medlens/` package,
+its tests, or the existing CLI was changed.
+
+Files added:
+
+- `web/package.json` — Vite 6 + React 19 + TypeScript 5 + Vitest 2 + ESLint 9
+  flat config + Prettier 3 + `tsx` runner. pnpm 10 is the package manager.
+- `web/tsconfig.json`, `tsconfig.app.json`, `tsconfig.node.json` — split
+  app/node TS projects with strict mode + `verbatimModuleSyntax`.
+- `web/vite.config.ts`, `web/vitest.config.ts` — minimal Vite + Vitest configs;
+  Vitest globals enabled.
+- `web/eslint.config.js`, `web/.prettierrc`, `web/.prettierignore` —
+  typescript-eslint + react-hooks + react-refresh.
+- `web/index.html`, `web/public/manifest.webmanifest` — PWA shell entry +
+  manifest stub (icons added in Phase 7).
+- `web/src/main.tsx`, `web/src/ui/App.tsx`, `web/src/ui/index.css` — debug
+  shell that runs the Phase 1 acceptance slice (HEAD both HF artifacts on load
+  and render size + ETag + repo commit).
+- `web/src/db/hf-fetch.ts` — pinned `ARTIFACT_URLS` constants and a `headArtifact`
+  helper. **The two artifact URLs are constants; the file is the single source
+  of truth that no other HF resource is ever fetched.**
+- `web/src/db/__tests__/hf-fetch.test.ts` — Vitest coverage for URL pinning,
+  HEAD parsing (`x-linked-size`, `x-linked-etag`, `x-repo-commit`,
+  `accept-ranges`), and 4xx error propagation.
+- `web/scripts/publish-hf.ts` — publish stub (real `@huggingface/hub` upload
+  wired in Phase 2). Reads `data/artifacts/normalization.sqlite` and
+  `data/artifacts/evidence.mobile.sqlite`.
+- `web/README.md`, `web/.gitignore`, `web/src/vite-env.d.ts`.
+
+Phase 1 acceptance slice (per plan):
+
+> blank app loads; running `pnpm publish:hf` pushes both SQLite files to HF;
+> the deployed app issues HEAD requests against the two `resolve/main/<file>`
+> URLs and renders sizes + ETags on a debug page.
+
+Implemented as `web/src/ui/App.tsx` driven by `headArtifact()` from
+`web/src/db/hf-fetch.ts`. The publish path is stubbed; real upload lands in
+Phase 2 alongside the streamed download.
+
+Local verification:
+
+```bash
+cd web
+pnpm install
+pnpm exec tsc -b   # passes with no errors
+pnpm lint          # passes
+pnpm test          # 3/3 vitest cases pass
+pnpm build         # tsc -b && vite build → dist/ ~62 KB gzip JS
+```
+
+Latest local results (2026-05-07):
+
+- `tsc -b`: clean.
+- `eslint .`: clean.
+- `vitest run`: `3 passed` in `src/db/__tests__/hf-fetch.test.ts`.
+- `vite build`: `dist/index.html 0.58 kB`, `dist/assets/index-*.js 197.25 kB
+  (gzip 61.96 kB)`, `dist/assets/index-*.css 0.23 kB`.
+
+Pinned URLs (only these two are ever fetched by the PWA):
+
+- `https://huggingface.co/datasets/ASHu2/medlens/resolve/main/normalization.sqlite`
+- `https://huggingface.co/datasets/ASHu2/medlens/resolve/main/evidence.mobile.sqlite`
+
+Next: Phase 2 — streamed download with progress, OPFS persistence, ETag-based
+freshness, and lazy `evidence.mobile.sqlite` open via sql.js.
+
+## PWA Phase 2 — SQLite Delivery + Browser Storage
+
+Status: complete (2026-05-07).
+
+Reference: `docs/pwa_plan.md` Phase 2.
+
+The PWA can now: detect OPFS, request storage persistence, stream both pinned
+HF artifacts into OPFS with progress + Range-based resume, persist
+ETag/X-Repo-Commit metadata, open `normalization.sqlite` eagerly via sql.js,
+open `evidence.mobile.sqlite` lazily on first access, and check upstream
+freshness without re-downloading.
+
+Files added:
+
+- `web/src/db/types.ts` — TypeScript row interfaces mirroring the Python
+  dataclasses in `medlens/tools/local_safety.py`
+  (`NormalizedMedication`, `KnownInteraction`, `InteractionEffect`,
+  `RawDdiSignal`, `CommonMedicineRow`, `EvidenceImportFile`).
+- `web/src/db/opfs.ts` — `BlobStore` interface plus an `OpfsBlobStore` backed
+  by `navigator.storage.getDirectory()` + `FileSystemWritableFileStream` and a
+  `MemoryBlobStore` for tests. Exposes `hasOpfs()` and `requestPersistence()`
+  helpers so the first-run flow can lock in `navigator.storage.persist()`
+  before download begins (per the Phase 0 lock-in).
+- `web/src/db/meta.ts` — `MetaStore` interface + `LocalStorageMetaStore` and
+  `MemoryMetaStore`. Persists `{ etag, repoCommit, contentLength, updatedAt }`
+  per artifact so subsequent launches can decide between resume / refresh /
+  short-circuit.
+- `web/src/db/sqlite.ts` — `loadSqlJs()` and `openDatabase(Uint8Array)` using
+  `sql.js@1.14.1`. WASM URL is resolved through Vite's
+  `?url` import so the bundle is self-contained. Both DBs are opened from
+  in-memory `Uint8Array`s per the v1 lock-in. wa-sqlite + OPFS-SAH remains the
+  documented escape hatch if `evidence.mobile.sqlite` ever grows past ~150 MB.
+- `web/src/db/stores.ts` — `openDbHandles(store)` returns `{ normalization,
+  evidence(), close }`. `evidence` is a memoized async getter that opens the
+  73 MB DB only on first call.
+- `web/src/db/version.ts` — `checkForUpdate(filename, url, meta)` and
+  `checkAllForUpdates(meta)` HEAD the pinned URLs and report
+  `fresh | etag-changed | repo-commit-changed | no-local-copy`.
+
+Files extended:
+
+- `web/src/db/hf-fetch.ts` now exports `ARTIFACTS` (the canonical
+  `{ key, filename, url }` list), `headArtifact()` (Phase 1), and a new
+  `downloadArtifact()` that streams the body via `Response.body.getReader()`,
+  writes through the `BlobStore` sink, calls `onProgress` at a configurable
+  byte cadence, and resumes via `Range: bytes=<offset>-` when a partial OPFS
+  file matches the persisted ETag. ETag mismatch on resume restarts the
+  download fresh; full content on disk with matching ETag short-circuits.
+  The two pinned URLs remain the only fetch surface.
+- `web/src/ui/App.tsx` is now a Phase 2 first-run shell:
+  - Detects OPFS, requests persistence, picks a `BlobStore`.
+  - If both files are present and their sizes match the persisted
+    `contentLength`, skips download and opens directly.
+  - Otherwise renders per-artifact progress bars driven by `downloadArtifact`.
+  - On completion, opens both DBs and runs the Phase 2 acceptance slice:
+    `SELECT COUNT(*)` against `drug`, `drug_alias`, `known_interaction`, and
+    `ddi_raw_signal`.
+
+Tests added:
+
+- `web/src/db/__tests__/opfs.test.ts` — `MemoryBlobStore` write-from-zero,
+  resume-from-offset, mismatched-offset rejection, delete.
+- `web/src/db/__tests__/meta.test.ts` — round-trip + per-filename isolation.
+- `web/src/db/__tests__/version.test.ts` — all four freshness reasons.
+- `web/src/db/__tests__/hf-fetch.test.ts` — extended with three new
+  `downloadArtifact` cases:
+  1. fresh download persists meta and reports progress;
+  2. partial-on-disk + matching ETag resumes via `Range: bytes=5-`;
+  3. ETag mismatch discards partial bytes and refetches.
+
+Phase 2 acceptance slice (per plan):
+
+> first launch shows a download dialog, persists files to OPFS, opens the DB,
+> and a debug page runs `SELECT COUNT(*) FROM known_interaction` after reload
+> with no network.
+
+Implemented end-to-end. Verified locally:
+
+```bash
+cd web
+pnpm exec tsc -b   # clean
+pnpm lint          # clean
+pnpm test          # 16/16 pass across 4 suites
+pnpm build         # dist/ emits sql-wasm.wasm (323 KB gzip) + index JS (79 KB gzip)
+```
+
+Verification of the no-network reload + `SELECT COUNT(*)` slice itself
+requires a real browser (OPFS isn't in vitest's node env); that manual check
+is the next session's first action — load `pnpm dev`, complete the download,
+DevTools → offline, reload, confirm rows render from OPFS.
+
+Known v1 limitations (deferred):
+
+- IndexedDB blob fallback for browsers without OPFS write — currently throws
+  with a clear message. Fallback ships before TWA submission.
+- `sql.js-httpvfs` desktop "no-download" mode — explicitly out of v1, not
+  implemented; download-to-OPFS remains the default path per the plan.
+- Real-browser cancel/resume UX — the underlying `downloadArtifact` supports
+  `AbortSignal` and resumes via `Range`, but the cancel button lands with
+  `FirstRunSetup.tsx` polish in Phase 6.
+
+Next: Phase 3 — TS port of `MedicationSafetyStore` (verbatim SQL + ranking +
+report builder) plus `TOOL_SCHEMAS` / `dispatch` from
+`medlens/tools/registry.py`. Audit `local_safety.py` for `REGEXP` /
+`create_function` / collation usage before porting (preflight grep already
+clean).

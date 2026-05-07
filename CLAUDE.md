@@ -54,7 +54,9 @@ new work depend on them unless the user explicitly asks.
   CSV when present.
 - `medlens/artifacts/build_evidence.py`
   Builds `evidence.sqlite` from the DDI CSVs, including
-  `india_common_generic_ddi_5000.csv`.
+  `india_common_generic_ddi_5000.csv`. It can also derive the mobile artifact
+  `evidence.mobile.sqlite` from `evidence.sqlite` by dictionary-normalizing
+  repeated raw-signal text while preserving all `ddi_raw_signal` rows.
 - `medlens/tools/local_safety.py`
   Provides normalization, pair lookup, single-drug interaction listing, raw
   signal retrieval, common India medicine metadata search/profile lookup,
@@ -83,6 +85,11 @@ Current artifact counts:
 - `evidence.sqlite`: 21,810 known interaction pairs, 105,460 pair-effect rows,
   162,600 raw DDI signal rows, 15,696 unresolved import issues, 5 source
   files.
+- `evidence.mobile.sqlite`: raw-preserving compact mobile evidence artifact,
+  about 73 MB from the current 260 MB source DB. It keeps all 162,600
+  `ddi_raw_signal` rows and source URLs. In this artifact `ddi_raw_signal` is a
+  read-only view over `ddi_raw_signal_compact` + `raw_text_value`, so runtime
+  reads keep the old column shape but mobile code must not write to it.
 
 ## Commands
 
@@ -103,6 +110,10 @@ python3 -m medlens.artifacts.build_evidence \
   --input-dir data/raw/DDI \
   --normalization-db data/artifacts/normalization.sqlite \
   --output data/artifacts/evidence.sqlite
+
+.venv/bin/python -m medlens.artifacts.build_evidence \
+  --compact-from data/artifacts/evidence.sqlite \
+  --output data/artifacts/evidence.mobile.sqlite
 ```
 
 Run a report:
