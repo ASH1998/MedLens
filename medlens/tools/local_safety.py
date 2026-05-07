@@ -376,6 +376,17 @@ class MedicationSafetyStore:
 
         with sqlite3.connect(self.evidence_db) as conn:
             conn.row_factory = sqlite3.Row
+            if not _relation_exists(conn, "ddi_raw_signal"):
+                return {
+                    "query": query,
+                    "filters": {"drug": drug, "region": region, "min_severity": min_severity},
+                    "drug_normalization": _normalized_medication_to_dict(drug_normalization)
+                    if drug_normalization is not None
+                    else None,
+                    "count": 0,
+                    "matches": [],
+                    "note": "Raw signal search is unavailable in compact evidence artifacts.",
+                }
             pair_rows = conn.execute(
                 f"""
                 SELECT DISTINCT ki.id, ki.drug_a, ki.drug_b, ki.severity, ki.severity_rank,
@@ -609,38 +620,40 @@ class MedicationSafetyStore:
                     (interaction_id, effect_limit),
                 )
             )
-            raw_signals = tuple(
-                RawDdiSignal(
-                    source_file=str(raw["source_file"]),
-                    source_row_number=int(raw["source_row_number"]),
-                    source_signal_id=str(raw["source_signal_id"] or ""),
-                    region=str(raw["region"]),
-                    drug1_raw=str(raw["drug1_raw"]),
-                    drug2_raw=str(raw["drug2_raw"]),
-                    adverse_effect=str(raw["adverse_effect"] or ""),
-                    severity=str(raw["severity"]),
-                    mechanism_or_rationale=str(raw["mechanism_or_rationale"] or ""),
-                    interaction_category=str(raw["interaction_category"] or ""),
-                    interaction_direction=str(raw["interaction_direction"] or ""),
-                    evidence_basis=str(raw["evidence_basis"] or ""),
-                    source_basis=str(raw["source_basis"] or ""),
-                    source_urls=str(raw["source_urls"] or ""),
-                    population_relevance=str(raw["population_relevance"] or ""),
-                    patient_risk_flags=str(raw["patient_risk_flags"] or ""),
-                    dataset_type=str(raw["dataset_type"] or ""),
-                    use_case_note=str(raw["use_case_note"] or ""),
+            raw_signals: tuple[RawDdiSignal, ...] = ()
+            if raw_signal_limit > 0 and _relation_exists(conn, "ddi_raw_signal"):
+                raw_signals = tuple(
+                    RawDdiSignal(
+                        source_file=str(raw["source_file"]),
+                        source_row_number=int(raw["source_row_number"]),
+                        source_signal_id=str(raw["source_signal_id"] or ""),
+                        region=str(raw["region"]),
+                        drug1_raw=str(raw["drug1_raw"]),
+                        drug2_raw=str(raw["drug2_raw"]),
+                        adverse_effect=str(raw["adverse_effect"] or ""),
+                        severity=str(raw["severity"]),
+                        mechanism_or_rationale=str(raw["mechanism_or_rationale"] or ""),
+                        interaction_category=str(raw["interaction_category"] or ""),
+                        interaction_direction=str(raw["interaction_direction"] or ""),
+                        evidence_basis=str(raw["evidence_basis"] or ""),
+                        source_basis=str(raw["source_basis"] or ""),
+                        source_urls=str(raw["source_urls"] or ""),
+                        population_relevance=str(raw["population_relevance"] or ""),
+                        patient_risk_flags=str(raw["patient_risk_flags"] or ""),
+                        dataset_type=str(raw["dataset_type"] or ""),
+                        use_case_note=str(raw["use_case_note"] or ""),
+                    )
+                    for raw in conn.execute(
+                        """
+                        SELECT *
+                        FROM ddi_raw_signal
+                        WHERE known_interaction_id = ?
+                        ORDER BY severity_rank DESC, source_file, source_row_number
+                        LIMIT ?
+                        """,
+                        (interaction_id, raw_signal_limit),
+                    )
                 )
-                for raw in conn.execute(
-                    """
-                    SELECT *
-                    FROM ddi_raw_signal
-                    WHERE known_interaction_id = ?
-                    ORDER BY severity_rank DESC, source_file, source_row_number
-                    LIMIT ?
-                    """,
-                    (interaction_id, raw_signal_limit),
-                )
-            )
 
         return KnownInteraction(
             found=True,
@@ -963,6 +976,8 @@ class MedicationSafetyStore:
 
         with sqlite3.connect(self.evidence_db) as conn:
             conn.row_factory = sqlite3.Row
+            if not _relation_exists(conn, "ddi_import_issue"):
+                return []
             return [
                 {
                     "source_file": str(row["source_file"]),
@@ -984,6 +999,16 @@ class MedicationSafetyStore:
                     params,
                 )
             ]
+
+
+def _relation_exists(conn: sqlite3.Connection, relation_name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
+            (relation_name,),
+        ).fetchone()
+        is not None
+    )
 
 
 _REGION_ALIASES: dict[str, tuple[str, ...]] = {

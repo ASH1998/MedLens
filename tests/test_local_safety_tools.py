@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from medlens.artifacts.build_evidence import compact_evidence_db
+from medlens.tools.local_safety import MedicationSafetyStore
 from tests.fixture_artifacts import build_fixture_store
 
 
@@ -77,6 +79,24 @@ class LocalSafetyToolsTest(unittest.TestCase):
         self.assertEqual(sources[0]["source_file"], "usa_prioritized_ddi_ade_signals.csv")
         self.assertEqual(sources[0]["rows_seen"], 6)
         self.assertEqual(issues[0]["reason"], "drug1_unresolved")
+
+    def test_compact_evidence_artifact_preserves_raw_evidence(self) -> None:
+        root = Path(self._tmp.name)
+        compact_db = root / "evidence.mobile.sqlite"
+        compact_evidence_db(root / "evidence.sqlite", compact_db)
+        compact_store = MedicationSafetyStore(root / "normalization.sqlite", compact_db)
+
+        interaction = compact_store.lookup_known_interaction("Advil", "Warfarin")
+        self.assertTrue(interaction.found)
+        self.assertEqual(interaction.raw_signals[0].source_urls, "https://example.test/a")
+
+        report = compact_store.build_structured_report(["Warfarin", "Advil"])
+        self.assertEqual(report.overall_severity, "Major")
+        self.assertEqual(compact_store.list_import_issues(query="unknown")[0]["reason"], "drug1_unresolved")
+        self.assertEqual(
+            compact_store.search_interactions_by_mechanism("renal", drug="captopril")["matches"][0]["drug_b"],
+            "ibuprofen",
+        )
 
 
 if __name__ == "__main__":
