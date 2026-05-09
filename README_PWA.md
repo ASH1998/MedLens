@@ -2,7 +2,11 @@
 
 Offline-first PWA that runs the deterministic MedLens safety pipeline in the browser. The full plan lives in `docs/pwa_plan.md`; per-phase build status lives in `BUILD_PROGRESS.md`. This file is the operator's quick reference.
 
-Currently shipped: **Phase 0** (HF artifact preflight) and **Phase 2** (streamed download → OPFS → sql.js, with first-run UI). Phase 3+ (tools / providers / agent / chat UI / service worker / TWA) are still pending.
+Currently shipped: **Phase 0** (HF artifact preflight), **Phase 2** (streamed download → OPFS → sql.js), **Phase 3** (deterministic tools port + 25-tool registry + parity tests against the real artifacts), **Phase 4 / 5** (offline template provider, Gemini + Anthropic browser providers, agent loop with 6/30/4 budgets and deterministic fallback), and **Phase 6** (ChatGPT-style first-run + chat UI). Still pending: **Phase 7** service worker, **Phase 8** TWA packaging.
+
+### Where is the chat?
+
+The chat surface is now the main screen after first-run setup. It includes a sidebar, persisted conversations, transcript, composer, collapsible tool trace, and Settings for provider/API key selection plus data update/delete actions. The default provider is the offline template path, so `Advil and Warfarin` can round-trip without network once the SQLite artifacts are local.
 
 ---
 
@@ -37,14 +41,10 @@ pnpm dev
 
 Open the printed URL (default `http://localhost:5173`). On first launch you should see:
 
-1. "Initializing…" → "Checking local artifacts…"
+1. "Download Safety Data" → "Checking local data..."
 2. The browser prompts for **persistent storage** (allow it — without persistence the OS may evict the 73 MB evidence DB under pressure).
 3. Two progress bars stream `normalization.sqlite` (~7 MB) and `evidence.mobile.sqlite` (~73 MB) directly from `https://huggingface.co/datasets/ASHu2/medlens/resolve/main/...` into the Origin Private File System.
-4. Both SQLite databases open via sql.js. The page renders a row-count table:
-   - `normalization.drug` ≈ 981
-   - `normalization.drug_alias` ≈ 1,669
-   - `evidence.known_interaction` ≈ 21,810
-   - `evidence.ddi_raw_signal` ≈ 162,600
+4. Both SQLite databases open via sql.js. The app switches into the chat shell.
 
 Subsequent reloads skip the download — sizes are checked against persisted metadata in `localStorage` and the existing OPFS files are reused.
 
@@ -52,12 +52,12 @@ Subsequent reloads skip the download — sizes are checked against persisted met
 
 This is the Phase 2 acceptance slice from the plan: after the first download completes, the app must work with no network.
 
-1. Wait until the row-count table renders.
+1. Wait until the chat shell renders.
 2. Chrome DevTools → **Network** tab → set throttling to **Offline**.
 3. Hit reload.
-4. The row counts should still render. No HTTP requests fire because both DBs come straight from OPFS and sql.js's WASM is precached as a Vite asset.
+4. Ask `Advil and Warfarin`. The offline template provider should answer from OPFS-backed SQLite.
 
-If the page errors instead of rendering, check DevTools → Application → Storage → IndexedDB / OPFS to confirm the files are there.
+If the page errors instead of rendering, check DevTools → Application → Storage → OPFS to confirm the files are there.
 
 ---
 
@@ -66,13 +66,13 @@ If the page errors instead of rendering, check DevTools → Application → Stor
 ```bash
 cd web
 pnpm lint           # eslint flat config
-pnpm test           # vitest run — 16 tests across 4 suites at the time of writing
+pnpm test           # vitest run — 27 tests across 8 suites at the time of writing
 pnpm test:watch     # vitest watch mode
 pnpm build          # tsc -b && vite build  →  web/dist/
 pnpm preview        # serve web/dist/ locally to confirm the production bundle
 ```
 
-`pnpm build` emits `web/dist/` with the sql.js WASM as a hashed asset (`sql-wasm-*.wasm`, ~323 KB gzip) plus the React app (~79 KB gzip).
+`pnpm build` emits `web/dist/` with the sql.js WASM as a hashed asset (`sql-wasm-*.wasm`, ~323 KB gzip) plus the React app.
 
 `pnpm format` runs Prettier across the project.
 
@@ -107,7 +107,7 @@ The download path keys off persisted metadata in browser `localStorage` and OPFS
    location.reload();
    ```
 
-Once Phase 6's Settings panel ships, this becomes a "Re-download data" button.
+The Settings panel also has a "Delete Local Data" action that clears both OPFS artifacts and their metadata.
 
 ---
 
@@ -118,7 +118,7 @@ The PWA does not auto-update. When new artifacts are pushed to `ASHu2/medlens`, 
 - `x-linked-etag` — LFS object SHA256 of the file (content/integrity).
 - `x-repo-commit` — the dataset commit (dataset-change anchor).
 
-`web/src/db/version.ts` exports `checkAllForUpdates(meta)` which HEADs both URLs and reports `fresh | etag-changed | repo-commit-changed | no-local-copy` per artifact. The Settings UI that surfaces this prompt lands in Phase 6; until then you can call it from the console:
+`web/src/db/version.ts` exports `checkAllForUpdates(meta)` which HEADs both URLs and reports `fresh | etag-changed | repo-commit-changed | no-local-copy` per artifact. The Settings UI surfaces this via "Check For Updates"; the console path is still useful while debugging:
 
 ```js
 import("/src/db/version.ts").then(async (m) => {
@@ -168,7 +168,13 @@ web/
   src/
     main.tsx                React root
     ui/
-      App.tsx               Phase 2 first-run shell (download + open + count)
+      App.tsx               chat shell wiring setup, providers, conversations
+      FirstRunSetup.tsx     OPFS artifact download + SQLite open gate
+      Sidebar.tsx           conversation list
+      MessageList.tsx       transcript
+      Composer.tsx          chat input
+      ToolTrace.tsx         collapsible tool-call trace
+      Settings.tsx          provider keys + data update/delete actions
       index.css
     db/
       hf-fetch.ts           pinned URLs + headArtifact + downloadArtifact (Range resume)
@@ -178,7 +184,7 @@ web/
       stores.ts             eager normalization, lazy evidence
       version.ts            HEAD-based freshness check
       types.ts              row interfaces mirroring Python dataclasses
-      __tests__/            opfs / meta / hf-fetch / version (16 cases)
+      __tests__/            opfs / meta / hf-fetch / version / parity cases
 ```
 
 The two artifact URLs (the only HF resources ever fetched) are pinned as constants in `web/src/db/hf-fetch.ts`:
@@ -191,7 +197,7 @@ The two artifact URLs (the only HF resources ever fetched) are pinned as constan
 ## What's next
 
 - **Phase 3** — TS port of `MedicationSafetyStore` (SQL + severity ranking + structured report) plus `TOOL_SCHEMAS` / `dispatch` from `medlens/tools/registry.py`. Verbatim port; golden-file Vitest fixtures generated from the existing Python tests guarantee parity.
-- **Phase 4–5** — Provider adapters (template + Gemini + Anthropic) and the agent loop port.
+- **Phase 4–5** — Provider adapters (template + Gemini + Anthropic), slash commands, and the agent loop port.
 - **Phase 6** — ChatGPT-style chat UI (`FirstRunSetup`, `Sidebar`, `MessageList`, `ToolTrace`, `Settings`).
 - **Phase 7** — `vite-plugin-pwa` injectManifest service worker.
 - **Phase 8** — Bubblewrap → Trusted Web Activity → Play Store.

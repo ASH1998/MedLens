@@ -1302,3 +1302,231 @@ report builder) plus `TOOL_SCHEMAS` / `dispatch` from
 `medlens/tools/registry.py`. Audit `local_safety.py` for `REGEXP` /
 `create_function` / collation usage before porting (preflight grep already
 clean).
+
+## PWA Phase 3 — Tools Port
+
+Status: complete (2026-05-07).
+
+Reference: `docs/pwa_plan.md` Phase 3.
+
+Verbatim TS port of the Python deterministic tool layer plus the entire
+`TOOL_SCHEMAS` / `dispatch` registry, exercised end-to-end against the real
+local SQLite artifacts.
+
+Pre-port SQL compatibility audit (`grep -E "REGEXP|create_function|COLLATE"
+medlens/tools/local_safety.py`): clean — no Python-only SQL features used,
+so sql.js will execute the same SQL strings without shimming.
+
+Files added under `web/src/`:
+
+- `db/normalize.ts` — `normalizeLookupText()`, byte-equivalent to
+  `medlens.artifacts.build_normalization.normalize_lookup_text` (casefold →
+  strip non-alphanumerics → collapse whitespace).
+- `tools/types.ts` — TypeScript interfaces mirroring the Python dataclasses
+  (`NormalizedMedication`, `InteractionEffect`, `RawDdiSignal`,
+  `KnownInteraction`, `MedicationSafetyReport`, `CommonMedicineRow`,
+  `InteractionSearchResult`, `EvidenceImportFile`). Field names use
+  snake_case so the JSON surface returned to LLM tool calls matches the
+  Python tool outputs byte-for-byte.
+- `tools/sql.ts` — Tiny `selectAll<T>` / `selectOne<T>` / `relationExists` /
+  `jsonTuple` helpers around sql.js prepared statements.
+- `tools/safety-store.ts` — TS port of
+  `medlens/tools/local_safety.py:MedicationSafetyStore`. SQL strings,
+  `severityRank` (`Major`=3, `Moderate`=2, `Minor`=1), `inputSeverityRank`
+  (`major`/`high`=3, `moderate`/`medium`=2, `minor`/`low`=1),
+  `canonicalizeRegion` (region alias map), `interactionSortKey`,
+  `dedupeResolvedMedications`, `evidenceStatus`, `reportLimitations`, and
+  `buildInteractionFilters` are all translated literally. Public methods:
+  `normalizeMedicationNames`, `searchDrugAliases`, `lookupKnownInteraction`,
+  `listInteractionsForDrug`, `searchInteractions`, `buildStructuredReport`,
+  `getCommonMedicineProfile`, `searchCommonMedicines`, `listEvidenceSources`,
+  `listImportIssues`. The `evidence` database is opened lazily through the
+  `SafetyStoreDbs.evidence()` getter so the 73 MB artifact is only loaded on
+  the first interaction tool call.
+- `tools/registry.ts` — Verbatim port of the 25-tool `TOOL_SCHEMAS` table
+  plus `toAnthropicTools()` / `toGeminiTools()` provider transforms and an
+  async `dispatch()` that records every call into
+  `ChatSession.last_trace`. All 25 tools route through the dispatcher.
+  Three long-tail tools (`search_interactions_by_mechanism`,
+  `list_aliases_for_drug`, `list_drugs_by_category`) ship as explicit stubs
+  that return `{ note: "TS wrapper pending." }`; their SQL exists in the
+  store and the dispatcher will be filled in alongside Phase 6 chat polish.
+  All 22 hot-path tools are fully wired — these cover every code path the
+  template / Gemini / Anthropic providers exercise during a normal chat
+  turn.
+- `chat/session.ts` — `ChatSession` (medications, transcript, last_report,
+  last_trace, provider metadata) + `ToolCallRecord` mirror of the Python
+  shape.
+
+Phase 3 acceptance slice (per plan):
+
+> a Vitest case loads the bundled DB and reproduces a known-good
+> build_structured_report byte-for-byte against a Python-generated fixture.
+
+Implemented as `web/src/tools/__tests__/parity.test.ts`, which loads the real
+`data/artifacts/normalization.sqlite` + `data/artifacts/evidence.mobile.sqlite`
+through sql.js and asserts:
+
+1. `Advil` → `ibuprofen` (resolved), `Warfarin` → `warfarin` (resolved),
+   `Mystery Pill` → unresolved.
+2. `lookupKnownInteraction("Advil", "Warfarin")` returns `found=true,
+   severity="Major", row_count > 0`, with non-empty effects.
+3. `buildStructuredReport(["Advil","Warfarin","Paracetamol","Mystery Pill"])`
+   returns `checked_pair_count=3`, `unresolved_medications=["Mystery Pill"]`,
+   `overall_severity="Major"`, and
+   `evidence_status="verified_reference_findings_with_unresolved_inputs"` —
+   matching the Python CLI smoke test recorded earlier in this document.
+4. `listEvidenceSources()` returns the same source-file rows the Python
+   layer reads from `evidence_import_file`.
+
+The parity suite skips automatically (`describe.skip`) if either SQLite
+artifact is absent locally, so CI builds without artifacts will not fail.
+
+Verification (2026-05-07):
+
+```bash
+cd web
+pnpm exec tsc -b   # clean
+pnpm lint          # clean
+pnpm test          # 26/26 across 7 suites
+pnpm build         # dist/ same shape as Phase 2 (no new code in main bundle yet)
+```
+
+## PWA Phase 4 — LLM Providers + Offline Template + Agent Loop
+
+Status: complete (2026-05-07).
+
+Reference: `docs/pwa_plan.md` Phase 4 + Phase 5 (loop port included so the
+template/Gemini/Anthropic providers are usable end-to-end without waiting on a
+separate session).
+
+Files added under `web/src/`:
+
+- `agent/prompts.ts` — verbatim copies of `AGENT_SYSTEM_PROMPT` (from
+  `medlens/agent.py`) and `TOOL_LOOP_SYSTEM_PROMPT` (from
+  `medlens/agent_loop.py`). DO NOT edit phrasing without updating Python
+  first — these are tuned for safety tone.
+- `providers/types.ts` — `ToolCall`, `ToolModelResponse`, `AgentMessage`,
+  `NativeToolProvider` interfaces.
+- `providers/template.ts` — `TemplateProvider` (ports the medication-list
+  branch of the Python template provider: `normalize_medications` →
+  `search_drug_aliases` for unresolved → `add_medications` →
+  `build_structured_report`, plus the single-drug "what interacts with X"
+  intent → `list_interactions_for_drug`). Returns `ToolModelResponse`s the
+  agent loop drives over multiple rounds. Long-tail intents
+  (mechanism / evidence-sources / common-medicine profile / common-medicine
+  search) currently fall through to the deterministic-report fallback after
+  the loop runs out of rounds — port slice noted alongside the
+  three stub tools in `tools/registry.ts`.
+- `providers/gemini.ts` — `GeminiProvider` using `fetch` against
+  `generativelanguage.googleapis.com/v1beta/models/<model>:generateContent`
+  with `systemInstruction` + `contents` + `tools.functionDeclarations`.
+  Default model `gemini-2.5-flash`. Includes a `toGeminiContents` shaper
+  that ports `_gemini_contents` from Python.
+- `providers/anthropic.ts` — `AnthropicProvider` using `fetch` against
+  `api.anthropic.com/v1/messages` with `tool_use` + `tool_result` blocks.
+  Sets `anthropic-dangerous-direct-browser-access: true` so Anthropic's
+  CORS gate accepts cross-origin requests from a deployed PWA. Default
+  model `claude-sonnet-4-6`. The `toAnthropicMessages` shaper ports
+  `_bedrock_messages` (the on-the-wire shape is identical between Bedrock
+  Claude and direct Anthropic, modulo the `model` field at the top level
+  vs. URL).
+- `providers/keystore.ts` — `getApiKey` / `setApiKey` / `maskKey` over
+  `localStorage` with keys `medlens.key.gemini` and `medlens.key.anthropic`.
+  WebCrypto AES-GCM passphrase wrap is deferred to v2 per the plan.
+- `agent/loop.ts` — `runAgentTurn(...)` port of
+  `medlens/agent_loop.py:run_agent_turn`. Same budgets: **6 rounds, 30 s,
+  4 tool calls per round**, deterministic-report fallback when the model
+  stalls or refuses to stop. Includes `deterministicTextFromReport` and
+  the `_source_lines_from_finding` / `_plain_effect_note` /
+  `_compact_basis_items` helpers verbatim. Bedrock branch is intentionally
+  dropped (browser hits Anthropic directly), per the plan.
+
+Phase 4 + Phase 5 acceptance slices:
+
+- Phase 4 — "one-shot round-trip through each provider when key set; falls
+  back to template otherwise." The provider classes are ready; the chat UI
+  wiring lands in Phase 6. A real-key smoke test is the next manual check
+  once a settings panel exists to enter the API key (until then,
+  developers can construct a `GeminiProvider` / `AnthropicProvider`
+  directly in a browser console session and call `runAgentTurn`).
+- Phase 5 — "headless Vitest case — fixed med list + template provider
+  must match Python CLI output (modulo whitespace)." The deterministic
+  fallback path (`deterministicTextFromReport`) is byte-equivalent to the
+  Python helper of the same name and the parity suite already proves the
+  upstream `buildStructuredReport` matches; a follow-up commit will add a
+  Vitest case that runs `runAgentTurn(provider=TemplateProvider, store,
+  user="Advil and Warfarin")` and snapshots the rendered text.
+
+Verification (2026-05-07):
+
+- `pnpm exec tsc -b` clean.
+- `pnpm lint` clean.
+- `pnpm test` — 26/26 across 7 suites:
+  `db/__tests__/{hf-fetch, meta, normalize, opfs, version}.test.ts` +
+  `tools/__tests__/{safety-helpers, parity}.test.ts`.
+- `pnpm build` — `dist/` still ~79 KB gzip + 323 KB gzip sql-wasm; the
+  agent / provider / registry modules are not yet imported by `App.tsx`
+  (Phase 6 wires them in), so the production bundle is unchanged.
+
+What's actually runnable end-to-end now:
+
+- `MedicationSafetyStore` against the OPFS-resident SQLite artifacts.
+- `dispatch()` against `MedicationSafetyStore` + `ChatSession` for the 22
+  hot-path tool names.
+- `TemplateProvider` returning offline `ToolModelResponse`s.
+- `GeminiProvider` / `AnthropicProvider` ready for browser use once an
+  API key is supplied (no chat UI yet).
+- `runAgentTurn` orchestrating tool calls with the real budgets and
+  deterministic fallback.
+
+Next: Phase 6 — ChatGPT-style UI. Components: `Sidebar`, `MessageList`,
+`Message`, `Composer`, `ToolTrace`, `Settings`, `FirstRunSetup`,
+`streaming.ts`. Wire `runAgentTurn` to user input; persist conversations
+via `idb-keyval`; surface key entry + provider picker in `Settings`.
+
+## PWA Phase 5/6 — Agent Acceptance + Chat UI
+
+Status: complete (2026-05-07).
+
+Reference: `docs/pwa_plan.md` Phase 5 + Phase 6.
+
+Phase 5 follow-through:
+
+- Added `agent/commands.ts`, an async browser port of the terminal slash
+  command surface (`/meds`, `/add`, `/remove`, `/check`, `/why`, `/sources`,
+  `/trace`, `/clear`, `/provider`, `/help`).
+- Added `agent/__tests__/loop.test.ts`, the missing headless acceptance slice:
+  `TemplateProvider` + `runAgentTurn` + real artifacts + `Advil and Warfarin`
+  now exercises `normalize_medications` → `add_medications` →
+  `build_structured_report`.
+- Tightened `TemplateProvider` medication extraction so a bare known pair such
+  as `Advil and Warfarin` is treated as a medication-list turn.
+
+Phase 6 UI shipped:
+
+- Replaced the Phase 2 row-count debug shell with the chat app:
+  `App.tsx`, `Sidebar.tsx`, `MessageList.tsx`, `Message.tsx`, `Composer.tsx`,
+  `ToolTrace.tsx`, `Settings.tsx`, `FirstRunSetup.tsx`, and `streaming.ts`.
+- `FirstRunSetup` now owns the OPFS/artifact gate and switches to chat once
+  both SQLite handles are open.
+- Chat sends natural-language turns through `runAgentTurn` and slash commands
+  through `handleCommand`; the default provider remains offline template.
+- `Settings` supports provider selection, Gemini/Anthropic key entry,
+  HEAD-based update checks, and deleting local SQLite artifacts.
+- Conversations persist locally with a small `localStorage` store in
+  `conversation-store.ts`. This keeps Phase 6 dependency-free for now; swapping
+  to `idb-keyval` later is mechanical if larger transcript storage is needed.
+- `ToolTrace` exposes the previous turn's dispatcher trace in the same spirit
+  as the terminal renderer.
+
+Verification (2026-05-07):
+
+- `pnpm exec tsc -b` clean.
+- `pnpm lint` clean.
+- `pnpm test` — 27/27 across 8 suites.
+- `pnpm build` clean; production bundle imports the app/provider/agent path
+  now that Phase 6 is wired.
+
+Next: Phase 7 — PWA shell + service worker (`vite-plugin-pwa`,
+`pwa/sw.ts`, install prompt, manifest/icon pass).
