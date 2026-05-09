@@ -1,236 +1,243 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ARTIFACTS, downloadArtifact } from "../db/hf-fetch";
-import { hasOpfs, pickBlobStore, requestPersistence } from "../db/opfs";
+import { runAgentTurn } from "../agent/loop";
+import { handleCommand } from "../agent/commands";
+import { ChatSession } from "../chat/session";
+import type { ToolCallRecord } from "../chat/session";
 import type { BlobStore } from "../db/opfs";
-import { getDefaultMetaStore } from "../db/meta";
-import { openDbHandles } from "../db/stores";
 import type { DbHandles } from "../db/stores";
-import { countRows } from "../db/sqlite";
+import { AnthropicProvider } from "../providers/anthropic";
+import { GeminiProvider } from "../providers/gemini";
+import { getApiKey } from "../providers/keystore";
+import { TemplateProvider } from "../providers/template";
+import type { NativeToolProvider } from "../providers/types";
+import { MedicationSafetyStore } from "../tools/safety-store";
+import { Composer } from "./Composer";
+import { FirstRunSetup } from "./FirstRunSetup";
+import { MessageList } from "./MessageList";
+import type { UiMessage } from "./Message";
+import { Settings } from "./Settings";
+import type { ProviderChoice } from "./Settings";
+import { Sidebar } from "./Sidebar";
+import { ToolTrace } from "./ToolTrace";
+import {
+  loadConversations,
+  newConversation,
+  saveConversations,
+  summaries,
+  titleFromMessage,
+} from "./conversation-store";
+import type { PersistedConversation } from "./conversation-store";
+import { streamText } from "./streaming";
 
-type Stage =
-  | { kind: "init" }
-  | { kind: "no-opfs" }
-  | { kind: "checking" }
-  | { kind: "downloading"; progress: Record<string, ProgressRow> }
-  | { kind: "ready"; counts: Record<string, number | string> }
-  | { kind: "error"; message: string };
-
-interface ProgressRow {
-  filename: string;
-  receivedBytes: number;
-  totalBytes: number | undefined;
-  resumed: boolean;
-  done: boolean;
-}
-
-const META = getDefaultMetaStore();
+type ReadyState =
+  | { kind: "setup" }
+  | { kind: "ready"; store: BlobStore; handles: DbHandles; safety: MedicationSafetyStore };
 
 export function App() {
-  const [stage, setStage] = useState<Stage>({ kind: "init" });
-  const storeRef = useRef<BlobStore | null>(null);
-  const handlesRef = useRef<DbHandles | null>(null);
+  const [ready, setReady] = useState<ReadyState>({ kind: "setup" });
+  const [conversations, setConversations] = useState<PersistedConversation[]>(() => loadConversations());
+  const [activeId, setActiveId] = useState(() => conversations[0].id);
+  const [providerChoice, setProviderChoice] = useState<ProviderChoice>("template");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [trace, setTrace] = useState<ToolCallRecord[]>([]);
+  const sessionRef = useRef(new ChatSession());
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const conversationsRef = useRef(conversations);
 
-  const initProgress = useMemo<Record<string, ProgressRow>>(
-    () =>
-      Object.fromEntries(
-        ARTIFACTS.map((a) => [
-          a.filename,
-          { filename: a.filename, receivedBytes: 0, totalBytes: undefined, resumed: false, done: false },
-        ]),
-      ),
-    [],
-  );
-
-  const openAndCount = useCallback(async (store: BlobStore) => {
-    const handles = await openDbHandles(store);
-    handlesRef.current = handles;
-    const counts: Record<string, number | string> = {};
-    try {
-      counts["normalization.drug"] = countRows(handles.normalization, "drug");
-      counts["normalization.drug_alias"] = countRows(handles.normalization, "drug_alias");
-      const evidence = await handles.evidence();
-      counts["evidence.known_interaction"] = countRows(evidence, "known_interaction");
-      counts["evidence.ddi_raw_signal"] = countRows(evidence, "ddi_raw_signal");
-    } catch (err) {
-      counts["error"] = (err as Error).message;
-    }
-    setStage({ kind: "ready", counts });
-  }, []);
-
-  const run = useCallback(async () => {
-    if (!hasOpfs()) {
-      setStage({ kind: "no-opfs" });
-      return;
-    }
-    setStage({ kind: "checking" });
-    try {
-      await requestPersistence();
-      const store = await pickBlobStore();
-      storeRef.current = store;
-
-      // Decide if any artifact still needs downloading.
-      const sizes = await Promise.all(ARTIFACTS.map((a) => store.size(a.filename)));
-      const needsDownload = ARTIFACTS.some((a, i) => {
-        const m = META.get(a.filename);
-        if (!m?.contentLength) return true;
-        return sizes[i] !== m.contentLength;
-      });
-
-      if (!needsDownload) {
-        await openAndCount(store);
-        return;
-      }
-
-      const progress = { ...initProgress };
-      setStage({ kind: "downloading", progress });
-
-      for (const artifact of ARTIFACTS) {
-        await downloadArtifact({
-          filename: artifact.filename,
-          url: artifact.url,
-          store,
-          meta: META,
-          onProgress: (p) => {
-            progress[artifact.filename] = {
-              filename: artifact.filename,
-              receivedBytes: p.receivedBytes,
-              totalBytes: p.totalBytes,
-              resumed: p.resumed,
-              done: false,
-            };
-            setStage({ kind: "downloading", progress: { ...progress } });
-          },
-        });
-        progress[artifact.filename] = { ...progress[artifact.filename], done: true };
-        setStage({ kind: "downloading", progress: { ...progress } });
-      }
-
-      await openAndCount(store);
-    } catch (err) {
-      setStage({ kind: "error", message: (err as Error).message });
-    }
-  }, [initProgress, openAndCount]);
+  const active = conversations.find((c) => c.id === activeId) ?? conversations[0];
 
   useEffect(() => {
-    run();
-    return () => {
-      handlesRef.current?.close();
+    conversationsRef.current = conversations;
+    saveConversations(conversations);
+  }, [conversations]);
+
+  useEffect(() => {
+    const conversation = conversationsRef.current.find((c) => c.id === activeId) ?? conversationsRef.current[0];
+    const session = new ChatSession({
+      provider_name: providerChoice,
+      privacy_mode: providerChoice === "template" ? "offline" : "cloud",
+    });
+    if (conversation?.messages) {
+      session.transcript = conversation.messages.map((m) => ({ role: m.role, content: m.content }));
+    }
+    if (conversation?.medications && ready.kind === "ready") {
+      session.medications = ready.safety.normalizeMedicationNames(conversation.medications);
+    }
+    sessionRef.current = session;
+    setTrace([]);
+  }, [activeId, providerChoice, ready]);
+
+  useEffect(() => {
+    const handles = ready.kind === "ready" ? ready.handles : null;
+    return () => handles?.close();
+  }, [ready]);
+
+  const provider = useMemo(() => makeProvider(providerChoice), [providerChoice]);
+
+  const updateActive = useCallback((updater: (conversation: PersistedConversation) => PersistedConversation) => {
+    setConversations((current) => current.map((c) => (c.id === activeId ? updater(c) : c)));
+  }, [activeId]);
+
+  const addMessage = useCallback((message: UiMessage) => {
+    updateActive((conversation) => ({
+      ...conversation,
+      title: conversation.messages.length === 0 && message.role === "user" ? titleFromMessage(message.content) : conversation.title,
+      messages: [...conversation.messages, message],
+      updatedAt: Date.now(),
+    }));
+  }, [updateActive]);
+
+  const replaceMessage = useCallback((id: string, content: string, pending = false) => {
+    updateActive((conversation) => ({
+      ...conversation,
+      messages: conversation.messages.map((message) =>
+        message.id === id ? { ...message, content, pending } : message,
+      ),
+      medications: sessionRef.current.medicationInputs(),
+      updatedAt: Date.now(),
+    }));
+  }, [updateActive]);
+
+  const send = useCallback(async (message: string) => {
+    if (ready.kind !== "ready" || busy) return;
+    setBusy(true);
+    streamAbortRef.current?.abort();
+    const abort = new AbortController();
+    streamAbortRef.current = abort;
+
+    const assistantId = crypto.randomUUID();
+    addMessage({ id: crypto.randomUUID(), role: "user", content: message });
+    addMessage({ id: assistantId, role: "assistant", content: "", pending: true });
+
+    try {
+      let finalText: string;
+      if (message.trim().startsWith("/")) {
+        const result = await handleCommand(message, { store: ready.safety, session: sessionRef.current });
+        finalText = formatCommandPayload(result.payload);
+      } else {
+        const result = await runAgentTurnWithFallback({
+          provider,
+          providerChoice,
+          session: sessionRef.current,
+          store: ready.safety,
+          userMessage: message,
+        });
+        finalText = result.final_text;
+      }
+      setTrace([...sessionRef.current.last_trace]);
+      await streamText(finalText, (chunk) => replaceMessage(assistantId, chunk, chunk.length < finalText.length), abort.signal);
+      replaceMessage(assistantId, finalText, false);
+    } catch (err) {
+      replaceMessage(assistantId, (err as Error).message, false);
+    } finally {
+      setBusy(false);
+    }
+  }, [addMessage, busy, provider, providerChoice, ready, replaceMessage]);
+
+  if (ready.kind === "setup") {
+    return (
+      <FirstRunSetup
+        onReady={({ store, handles }) =>
+          setReady({ kind: "ready", store, handles, safety: new MedicationSafetyStore(handles) })
+        }
+      />
+    );
+  }
+
+  function createConversation() {
+    const next = newConversation();
+    setConversations((current) => [next, ...current]);
+    setActiveId(next.id);
+  }
+
+  function resetData() {
+    if (ready.kind === "ready") ready.handles.close();
+    setReady({ kind: "setup" });
+  }
+
+  return (
+    <div className="app-shell">
+      <Sidebar
+        conversations={summaries(conversations)}
+        activeId={activeId}
+        onSelect={setActiveId}
+        onNew={createConversation}
+      />
+      <main className="chat-shell">
+        <header className="chat-header">
+          <div>
+            <h1>{active.title}</h1>
+            <p>{providerLabel(provider)} · {sessionRef.current.medicationInputs().length} meds in session</p>
+          </div>
+          <button type="button" onClick={() => setSettingsOpen(true)}>
+            Settings
+          </button>
+        </header>
+        <MessageList messages={active.messages} />
+        <ToolTrace trace={trace} />
+        <Composer disabled={busy} onSend={send} />
+      </main>
+      <Settings
+        open={settingsOpen}
+        provider={providerChoice}
+        store={ready.store}
+        onClose={() => setSettingsOpen(false)}
+        onProviderChange={setProviderChoice}
+        onDataDeleted={resetData}
+      />
+    </div>
+  );
+}
+
+function makeProvider(choice: ProviderChoice): NativeToolProvider {
+  if (choice === "gemini") {
+    const apiKey = getApiKey("gemini");
+    if (apiKey) return new GeminiProvider({ apiKey });
+  }
+  if (choice === "anthropic") {
+    const apiKey = getApiKey("anthropic");
+    if (apiKey) return new AnthropicProvider({ apiKey });
+  }
+  return new TemplateProvider();
+}
+
+function providerLabel(provider: NativeToolProvider): string {
+  return provider.name === "template" ? "offline template" : provider.name;
+}
+
+function formatCommandPayload(payload: unknown): string {
+  if (typeof payload === "string") return payload;
+  return JSON.stringify(payload, null, 2);
+}
+
+async function runAgentTurnWithFallback(args: {
+  provider: NativeToolProvider;
+  providerChoice: ProviderChoice;
+  session: ChatSession;
+  store: MedicationSafetyStore;
+  userMessage: string;
+}) {
+  try {
+    return await runAgentTurn({
+      provider: args.provider,
+      session: args.session,
+      store: args.store,
+      user_message: args.userMessage,
+    });
+  } catch (err) {
+    if (args.providerChoice === "template") throw err;
+    args.session.provider_name = "template";
+    args.session.privacy_mode = "offline";
+    const fallback = await runAgentTurn({
+      provider: new TemplateProvider(),
+      session: args.session,
+      store: args.store,
+      user_message: args.userMessage,
+    });
+    return {
+      ...fallback,
+      final_text: `The selected cloud provider failed, so I used the offline template instead.\n\n${fallback.final_text}`,
     };
-  }, [run]);
-
-  return (
-    <main style={{ padding: "2rem", maxWidth: 880, margin: "0 auto" }}>
-      <h1 style={{ marginBottom: "0.25rem" }}>MedLens</h1>
-      <p style={{ opacity: 0.75, marginTop: 0 }}>
-        Offline-first medication safety. Phase 2 first-run shell.
-      </p>
-
-      {stage.kind === "init" && <p>Initializing…</p>}
-      {stage.kind === "checking" && <p>Checking local artifacts…</p>}
-
-      {stage.kind === "no-opfs" && (
-        <Notice tone="warn">
-          This browser does not expose OPFS. The IndexedDB blob fallback ships in a later phase.
-        </Notice>
-      )}
-
-      {stage.kind === "error" && <Notice tone="error">{stage.message}</Notice>}
-
-      {stage.kind === "downloading" && (
-        <section>
-          <h2>Downloading safety data</h2>
-          <p style={{ opacity: 0.7 }}>
-            Both files are fetched directly from the public dataset
-            <code> ASHu2/medlens</code> and persisted to OPFS. Subsequent launches skip this.
-          </p>
-          {Object.values(stage.progress).map((row) => (
-            <ProgressBar key={row.filename} row={row} />
-          ))}
-        </section>
-      )}
-
-      {stage.kind === "ready" && (
-        <section>
-          <h2>Ready</h2>
-          <p style={{ opacity: 0.7 }}>
-            Both SQLite databases opened from OPFS via sql.js. The Phase 2 acceptance slice runs
-            <code> SELECT COUNT(*) </code> against the canonical tables below.
-          </p>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr>
-                <th align="left">Source</th>
-                <th align="right">Rows</th>
-              </tr>
-            </thead>
-            <tbody>
-              {Object.entries(stage.counts).map(([k, v]) => (
-                <tr key={k} style={{ borderTop: "1px solid #2a2f45" }}>
-                  <td>
-                    <code>{k}</code>
-                  </td>
-                  <td align="right">{typeof v === "number" ? v.toLocaleString() : v}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
-    </main>
-  );
-}
-
-function ProgressBar({ row }: { row: ProgressRow }) {
-  const pct =
-    row.totalBytes && row.totalBytes > 0
-      ? Math.min(100, Math.round((row.receivedBytes / row.totalBytes) * 100))
-      : undefined;
-  return (
-    <div style={{ marginBottom: "1rem" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.25rem" }}>
-        <strong>{row.filename}</strong>
-        <span style={{ opacity: 0.75 }}>
-          {formatBytes(row.receivedBytes)}
-          {row.totalBytes ? ` / ${formatBytes(row.totalBytes)}` : ""}
-          {row.resumed ? " · resumed" : ""}
-          {row.done ? " · done" : ""}
-        </span>
-      </div>
-      <div style={{ background: "#1a1f33", height: 8, borderRadius: 4, overflow: "hidden" }}>
-        <div
-          style={{
-            width: pct !== undefined ? `${pct}%` : "0%",
-            height: "100%",
-            background: "#6c8cff",
-            transition: "width 120ms linear",
-          }}
-        />
-      </div>
-    </div>
-  );
-}
-
-function Notice({ tone, children }: { tone: "warn" | "error"; children: React.ReactNode }) {
-  const palette = tone === "error" ? "#ff8a8a" : "#ffd166";
-  return (
-    <div
-      style={{
-        border: `1px solid ${palette}`,
-        background: "rgba(255,255,255,0.04)",
-        padding: "1rem",
-        borderRadius: 6,
-        margin: "1rem 0",
-        color: palette,
-      }}
-    >
-      {children}
-    </div>
-  );
-}
-
-function formatBytes(n: number | undefined): string {
-  if (n === undefined || Number.isNaN(n)) return "—";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  }
 }

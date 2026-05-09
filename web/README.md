@@ -16,8 +16,13 @@ pnpm build
 ## Phase status
 
 - Phase 0 — HF artifact access + storage preflight: **done** (anonymous reads on `ASHu2/medlens` confirmed; CORS, ETag, X-Repo-Commit captured).
-- Phase 1 — scaffolding: **in progress** (this commit).
-- Phase 2 — SQLite delivery + browser storage: **next**.
+- Phase 1 — scaffolding: **done**.
+- Phase 2 — SQLite delivery + browser storage: **done**.
+- Phase 3 — deterministic tools port: **done**.
+- Phase 4 — provider adapters: **done**.
+- Phase 5 — agent loop + slash commands: **done**.
+- Phase 6 — chat UI: **done**.
+- Phase 7 — service worker: **next**.
 
 ## Layout
 
@@ -26,11 +31,11 @@ web/
   public/manifest.webmanifest
   scripts/publish-hf.ts           # upload artifacts to ASHu2/medlens (stub)
   src/
-    db/        hf-fetch.ts (HEAD-only in Phase 1)
-    tools/     # Phase 3
-    providers/ # Phase 4
-    agent/     # Phase 5
-    ui/        App.tsx, index.css
+    db/        artifact fetch, OPFS store, sql.js open, freshness checks
+    tools/     deterministic safety store + tool registry
+    providers/ template, Gemini, Anthropic, localStorage key store
+    agent/     loop, prompts, slash commands
+    ui/        chat shell, first-run setup, settings, transcript, trace
     pwa/       # Phase 7
 ```
 
