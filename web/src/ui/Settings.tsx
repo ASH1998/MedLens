@@ -7,7 +7,7 @@ import { getApiKey, maskKey, setApiKey } from "../providers/keystore";
 
 const META = getDefaultMetaStore();
 
-export type ProviderChoice = "template" | "gemini" | "anthropic";
+export type ProviderChoice = "bedrock" | "gemini" | "anthropic";
 
 export function Settings({
   open,
@@ -62,11 +62,15 @@ export function Settings({
         <label>
           Provider
           <select value={provider} onChange={(event) => onProviderChange(event.target.value as ProviderChoice)}>
-            <option value="template">Template offline</option>
+            <option value="bedrock">Bedrock Claude</option>
             <option value="gemini">Gemini</option>
             <option value="anthropic">Anthropic</option>
           </select>
         </label>
+
+        <p className="settings-help">
+          Bedrock uses the AWS and Claude settings from the project <code>.env</code> through the local dev server.
+        </p>
 
         <div className="key-grid">
           <label>

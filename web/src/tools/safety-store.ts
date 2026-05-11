@@ -288,7 +288,39 @@ export class MedicationSafetyStore {
     return Array.from(grouped.entries())
       .slice(0, limit)
       .map(([canonical, aliases]) => ({ canonical, aliases: aliases.slice(0, 5) }))
+      .concat(grouped.size === 0 ? this.strengthTrimmedDrugAliases(normalized_query, limit) : [])
       .concat(grouped.size === 0 ? this.fuzzyDrugAliases(normalized_query, limit) : []);
+  }
+
+  private strengthTrimmedDrugAliases(normalizedQuery: string, limit: number): { canonical: string; aliases: string[] }[] {
+    const trimmed = normalizedQuery.replace(/\s*\d+(?:\s*(?:mg|mcg|g|ml|iu))?$/i, "").trim();
+    if (!trimmed || trimmed === normalizedQuery || trimmed.length < 3) return [];
+    const rows = selectAll<{ canonical_name: string; alias: string }>(
+      this.dbs.normalization,
+      `SELECT d.canonical_name AS canonical_name, a.alias AS alias
+       FROM drug_alias a JOIN drug d ON d.id = a.drug_id
+       WHERE a.normalized_alias = ? OR a.normalized_alias LIKE ?
+       ORDER BY
+         CASE WHEN a.normalized_alias = ? THEN 0 ELSE 1 END,
+         LENGTH(a.alias),
+         d.canonical_name,
+         a.alias
+       LIMIT ?`,
+      [trimmed, `${trimmed} %`, trimmed, Math.max(1, limit * 4)],
+    );
+    const grouped = new Map<string, string[]>();
+    for (const row of rows) {
+      const canonical = String(row.canonical_name);
+      const alias = String(row.alias);
+      const aliases = grouped.get(canonical) ?? [];
+      if (!aliases.includes(alias)) aliases.push(alias);
+      grouped.set(canonical, aliases);
+      if (grouped.size >= limit) break;
+    }
+    return Array.from(grouped.entries()).map(([canonical, aliases]) => ({
+      canonical,
+      aliases: aliases.slice(0, 5),
+    }));
   }
 
   private fuzzyDrugAliases(normalizedQuery: string, limit: number): { canonical: string; aliases: string[] }[] {
@@ -644,7 +676,7 @@ export class MedicationSafetyStore {
     aliases: string[];
     matches: CommonMedicineRow[];
   }> {
-    const [normalized] = this.normalizeMedicationNames([name]);
+    let [normalized] = this.normalizeMedicationNames([name]);
     const aliases: string[] = [];
     const matches: CommonMedicineRow[] = [];
     if (normalized.resolved && normalized.drug_id !== null) {
@@ -670,6 +702,36 @@ export class MedicationSafetyStore {
         [normalized.drug_id],
       );
       for (const a of aliasRows) aliases.push(String(a.alias));
+    }
+    if (matches.length === 0 && !normalized.resolved) {
+      const aliasMatch = this.searchDrugAliases(name, 1)[0];
+      if (aliasMatch?.canonical) {
+        [normalized] = this.normalizeMedicationNames([aliasMatch.canonical]);
+        if (normalized.resolved && normalized.drug_id !== null) {
+          const rows = selectAll<RawCommonRow>(
+            this.dbs.normalization,
+            `SELECT m.*, d.canonical_name
+             FROM india_common_medicine m JOIN drug d ON d.id = m.drug_id
+             WHERE m.drug_id = ?
+             ORDER BY m.source_row_number
+             LIMIT ?`,
+            [normalized.drug_id, Math.max(1, limit)],
+          );
+          for (const r of rows) matches.push(commonRowToObj(r));
+          const aliasRows = selectAll<{ alias: string }>(
+            this.dbs.normalization,
+            `SELECT alias FROM drug_alias
+             WHERE drug_id = ?
+             ORDER BY
+               CASE alias_type WHEN 'canonical' THEN 0 WHEN 'brand' THEN 1 ELSE 2 END,
+               LENGTH(alias),
+               alias
+             LIMIT 20`,
+            [normalized.drug_id],
+          );
+          for (const a of aliasRows) aliases.push(String(a.alias));
+        }
+      }
     }
     if (matches.length === 0) {
       const fallback = await this.searchCommonMedicines({ query: name, limit });

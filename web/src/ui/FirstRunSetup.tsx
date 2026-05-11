@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ARTIFACTS, downloadArtifact } from "../db/hf-fetch";
 import { getDefaultMetaStore } from "../db/meta";
 import { hasOpfs, pickBlobStore, requestPersistence } from "../db/opfs";
@@ -20,78 +20,90 @@ type SetupStage =
   | { kind: "blocked"; message: string }
   | { kind: "downloading"; progress: Record<string, ProgressRow> }
   | { kind: "opening" }
+  | { kind: "ready" }
   | { kind: "error"; message: string };
 
 const META = getDefaultMetaStore();
 
 export function FirstRunSetup({ onReady }: { onReady: (ready: { store: BlobStore; handles: DbHandles }) => void }) {
   const [stage, setStage] = useState<SetupStage>({ kind: "checking" });
-  const initialProgress = useMemo(
-    () =>
-      Object.fromEntries(
-        ARTIFACTS.map((a) => [
-          a.filename,
-          {
-            filename: a.filename,
-            receivedBytes: 0,
-            totalBytes: undefined,
-            resumed: false,
-            done: false,
-            startedAt: performance.now(),
-          },
-        ]),
-      ) as Record<string, ProgressRow>,
-    [],
-  );
-
-  const run = useCallback(async () => {
-    if (!hasOpfs()) {
-      setStage({ kind: "blocked", message: "This browser does not expose OPFS storage." });
-      return;
-    }
-    setStage({ kind: "checking" });
-    try {
-      await requestPersistence();
-      const store = await pickBlobStore();
-      const sizes = await Promise.all(ARTIFACTS.map((a) => store.size(a.filename)));
-      const needsDownload = ARTIFACTS.some((artifact, index) => {
-        const meta = META.get(artifact.filename);
-        return !meta?.contentLength || sizes[index] !== meta.contentLength;
-      });
-
-      if (needsDownload) {
-        const progress = { ...initialProgress };
-        setStage({ kind: "downloading", progress });
-        for (const artifact of ARTIFACTS) {
-          await downloadArtifact({
-            filename: artifact.filename,
-            url: artifact.url,
-            store,
-            meta: META,
-            onProgress: (p) => {
-              progress[artifact.filename] = {
-                ...progress[artifact.filename],
-                receivedBytes: p.receivedBytes,
-                totalBytes: p.totalBytes,
-                resumed: p.resumed,
-              };
-              setStage({ kind: "downloading", progress: { ...progress } });
-            },
-          });
-          progress[artifact.filename] = { ...progress[artifact.filename], done: true };
-          setStage({ kind: "downloading", progress: { ...progress } });
-        }
-      }
-
-      setStage({ kind: "opening" });
-      onReady({ store, handles: await openDbHandles(store) });
-    } catch (err) {
-      setStage({ kind: "error", message: (err as Error).message });
-    }
-  }, [initialProgress, onReady]);
+  const onReadyRef = useRef(onReady);
 
   useEffect(() => {
-    run();
+    onReadyRef.current = onReady;
+  }, [onReady]);
+
+  const run = useCallback(() => {
+    const abort = new AbortController();
+    if (!hasOpfs()) {
+      setStage({ kind: "blocked", message: "This browser does not expose OPFS storage." });
+      return () => abort.abort();
+    }
+    setStage({ kind: "checking" });
+
+    void (async () => {
+      try {
+        await requestPersistence();
+        const store = await pickBlobStore();
+        const sizes = await Promise.all(ARTIFACTS.map((a) => store.size(a.filename)));
+        const needsDownload = ARTIFACTS.some((artifact, index) => {
+          const meta = META.get(artifact.filename);
+          return !meta?.contentLength || sizes[index] !== meta.contentLength;
+        });
+
+        if (needsDownload) {
+          const progress = createInitialProgress();
+          setStage({ kind: "downloading", progress });
+          for (const artifact of ARTIFACTS) {
+            if (abort.signal.aborted) return;
+            const result = await downloadArtifact({
+              filename: artifact.filename,
+              url: artifact.url,
+              store,
+              meta: META,
+              signal: abort.signal,
+              onProgress: (p) => {
+                if (abort.signal.aborted) return;
+                progress[artifact.filename] = {
+                  ...progress[artifact.filename],
+                  receivedBytes: p.receivedBytes,
+                  totalBytes: p.totalBytes,
+                  resumed: p.resumed,
+                };
+                setStage({ kind: "downloading", progress: { ...progress } });
+              },
+            });
+            progress[artifact.filename] = {
+              ...progress[artifact.filename],
+              receivedBytes: result.receivedBytes,
+              totalBytes: result.totalBytes,
+              resumed: result.resumed,
+              done: true,
+            };
+            setStage({ kind: "downloading", progress: { ...progress } });
+          }
+        }
+
+        if (abort.signal.aborted) return;
+        setStage({ kind: "opening" });
+        const handles = await openDbHandles(store);
+        if (abort.signal.aborted) {
+          handles.close();
+          return;
+        }
+        setStage({ kind: "ready" });
+        onReadyRef.current({ store, handles });
+      } catch (err) {
+        if (abort.signal.aborted || (err as Error).name === "AbortError") return;
+        setStage({ kind: "error", message: (err as Error).message });
+      }
+    })();
+
+    return () => abort.abort();
+  }, []);
+
+  useEffect(() => {
+    return run();
   }, [run]);
 
   return (
@@ -107,6 +119,7 @@ export function FirstRunSetup({ onReady }: { onReady: (ready: { store: BlobStore
 
         {stage.kind === "checking" && <p>Checking local data...</p>}
         {stage.kind === "opening" && <p>Opening local SQLite data...</p>}
+        {stage.kind === "ready" && <p>Ready.</p>}
         {stage.kind === "blocked" && <Notice>{stage.message}</Notice>}
         {stage.kind === "error" && <Notice>{stage.message}</Notice>}
 
@@ -120,6 +133,22 @@ export function FirstRunSetup({ onReady }: { onReady: (ready: { store: BlobStore
       </section>
     </main>
   );
+}
+
+function createInitialProgress(): Record<string, ProgressRow> {
+  return Object.fromEntries(
+    ARTIFACTS.map((a) => [
+      a.filename,
+      {
+        filename: a.filename,
+        receivedBytes: 0,
+        totalBytes: undefined,
+        resumed: false,
+        done: false,
+        startedAt: performance.now(),
+      },
+    ]),
+  ) as Record<string, ProgressRow>;
 }
 
 function ProgressBar({ row }: { row: ProgressRow }) {

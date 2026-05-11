@@ -14,6 +14,9 @@ export function Composer({ disabled, onSend }: { disabled: boolean; onSend: (mes
 
   return (
     <form className="composer" onSubmit={submit}>
+      <button type="button" className="composer-tool" disabled={disabled} aria-label="Add">
+        +
+      </button>
       <textarea
         value={value}
         disabled={disabled}
@@ -24,7 +27,7 @@ export function Composer({ disabled, onSend }: { disabled: boolean; onSend: (mes
             submit(event);
           }
         }}
-        placeholder="Ask about medicines..."
+        placeholder="Ask anything"
         rows={1}
       />
       <button type="submit" disabled={disabled || !value.trim()} aria-label="Send">

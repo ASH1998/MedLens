@@ -99,6 +99,46 @@ describeIf("runAgentTurn with TemplateProvider", () => {
     expect(result.final_text.toLowerCase()).toContain("acenocoumarol");
     expect(result.final_text.toLowerCase()).not.toContain("couldn't match");
   });
+
+  it("uses alias-search recovery for Dolo6 before checking aspirin interactions", async () => {
+    const store = await openStore();
+    const session = new ChatSession();
+    const result = await runAgentTurn({
+      provider: new TemplateProvider(),
+      session,
+      store,
+      user_message: "I am taking aspirin and dolo6 ?",
+    });
+
+    expect(result.used_tools).toEqual([
+      "normalize_medications",
+      "search_drug_aliases",
+      "add_medications",
+      "build_structured_report",
+    ]);
+    expect(result.trace[0]?.args).toEqual({ names: ["aspirin", "dolo6"] });
+    expect(result.trace[1]?.args).toEqual({ query: "dolo6", limit: 5 });
+    expect(result.trace[2]?.args).toEqual({ names: ["aspirin", "acetaminophen"] });
+    expect(result.final_text.toLowerCase()).toContain("aspirin");
+    expect(result.final_text.toLowerCase()).toContain("acetaminophen");
+    expect(result.final_text.toLowerCase()).not.toContain("could not confidently match");
+  });
+
+  it("routes common medicine profile questions through the profile tool", async () => {
+    const store = await openStore();
+    const session = new ChatSession();
+    const result = await runAgentTurn({
+      provider: new TemplateProvider(),
+      session,
+      store,
+      user_message: "what is dolo6?",
+    });
+
+    expect(result.used_tools).toEqual(["get_common_medicine_profile"]);
+    expect(result.trace[0]?.args).toEqual({ name: "dolo6", limit: 3 });
+    expect(result.final_text.toLowerCase()).toContain("maps locally");
+    expect(result.final_text.toLowerCase()).toContain("acetaminophen");
+  });
 });
 
 async function openStore(): Promise<MedicationSafetyStore> {

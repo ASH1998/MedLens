@@ -23,6 +23,7 @@ export interface RunAgentTurnArgs {
   session: ChatSession;
   store: MedicationSafetyStore;
   user_message: string;
+  audience_prompt?: string;
   candidate_medications?: string[];
   effect_limit?: number;
   max_rounds?: number;
@@ -36,6 +37,7 @@ export async function runAgentTurn(args: RunAgentTurnArgs): Promise<AgentTurnRes
     session,
     store,
     user_message,
+    audience_prompt,
     candidate_medications = [],
     effect_limit = 5,
     max_rounds = 6,
@@ -53,6 +55,9 @@ export async function runAgentTurn(args: RunAgentTurnArgs): Promise<AgentTurnRes
     },
   ];
   const started = performance.now() / 1000;
+  const systemPrompt = audience_prompt
+    ? `${TOOL_LOOP_SYSTEM_PROMPT}\n\nAudience style:\n${audience_prompt}`
+    : TOOL_LOOP_SYSTEM_PROMPT;
 
   let finalText = "";
   let fallbackUsed = false;
@@ -63,7 +68,7 @@ export async function runAgentTurn(args: RunAgentTurnArgs): Promise<AgentTurnRes
       break;
     }
     const response = await provider.generateWithTools(
-      TOOL_LOOP_SYSTEM_PROMPT,
+      systemPrompt,
       messages,
       toolsForProvider(provider.name),
     );
