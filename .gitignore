@@ -76,3 +76,10 @@ coverage/
 # TypeScript
 *.tsbuildinfo
 .mcp.json
+*.jsonl
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+unsloth_compiled_cache/
+.gradle-dist/

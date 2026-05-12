@@ -1,0 +1,225 @@
+package com.medlens.android.ui
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.medlens.android.data.ConversationStore
+import com.medlens.android.data.PersistedConversation
+import com.medlens.android.data.UiMessage
+import com.medlens.android.litert.LiteRtLmProvider
+import com.medlens.android.model.GemmaModelManager
+import com.medlens.android.model.ModelState
+import com.medlens.core.agent.AgentOrchestrator
+import com.medlens.core.agent.ToolDispatcher
+import com.medlens.core.agent.model.AgentMessage
+import com.medlens.core.agent.model.ChatSession
+import com.medlens.core.agent.model.ToolCallRecord
+import com.medlens.core.data.DatabaseInstaller
+import com.medlens.core.data.SafetyRepository
+import com.medlens.core.data.SqliteSafetyRepository
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+sealed interface SetupStage {
+    data object Checking : SetupStage
+    data object Copying : SetupStage
+    data object Ready : SetupStage
+    data class Error(val message: String) : SetupStage
+}
+
+data class MedLensUiState(
+    val setupStage: SetupStage = SetupStage.Checking,
+    val conversations: List<PersistedConversation> = listOf(ConversationStore.newConversation()),
+    val activeConversationId: String = "",
+    val busy: Boolean = false,
+    val trace: List<ToolCallRecord> = emptyList(),
+    val modelState: ModelState = ModelState.NotDownloaded,
+    val providerLabel: String = "LiteRT-LM scaffold",
+)
+
+class MedLensViewModel(
+    application: Application,
+) : AndroidViewModel(application) {
+    private val appContext = application.applicationContext
+    private val conversationStore = ConversationStore(appContext)
+    private val installer = DatabaseInstaller(appContext)
+    private val modelManager = GemmaModelManager(appContext)
+    private val session = ChatSession()
+
+    private var repository: SafetyRepository? = null
+    private var liteRtProvider: LiteRtLmProvider? = null
+
+    private val _uiState = MutableStateFlow(MedLensUiState())
+    val uiState: StateFlow<MedLensUiState> = _uiState.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            conversationStore.state.collect { state ->
+                _uiState.update {
+                    it.copy(
+                        conversations = state.conversations,
+                        activeConversationId = state.activeId,
+                    )
+                }
+                hydrateSession(state.conversations.firstOrNull { it.id == state.activeId })
+            }
+        }
+        viewModelScope.launch {
+            modelManager.observeState().collect { state ->
+                if (state is ModelState.Ready && liteRtProvider == null) {
+                    liteRtProvider = LiteRtLmProvider(appContext, state.path)
+                }
+                if (state !is ModelState.Ready) {
+                    liteRtProvider?.close()
+                    liteRtProvider = null
+                }
+                _uiState.update { it.copy(modelState = state, providerLabel = if (state is ModelState.Ready) "LiteRT-LM" else "deterministic local") }
+            }
+        }
+        bootstrap()
+    }
+
+    fun bootstrap() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(setupStage = SetupStage.Copying) }
+            runCatching {
+                val installed = installer.ensureInstalled()
+                repository?.close()
+                repository = SqliteSafetyRepository(installed)
+            }.onSuccess {
+                hydrateSession(activeConversation())
+                _uiState.update { state -> state.copy(setupStage = SetupStage.Ready) }
+            }.onFailure { error ->
+                _uiState.update { state -> state.copy(setupStage = SetupStage.Error(error.message ?: "Setup failed")) }
+            }
+        }
+    }
+
+    fun sendMessage(message: String) {
+        if (message.isBlank() || _uiState.value.busy) return
+        val repo = repository ?: return
+        val orchestrator = AgentOrchestrator(
+            store = repo,
+            dispatcher = ToolDispatcher(repo),
+            provider = liteRtProvider,
+        )
+        val current = activeConversation() ?: return
+        val assistantId = java.util.UUID.randomUUID().toString()
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(busy = true) }
+            val userMessage = UiMessage(id = java.util.UUID.randomUUID().toString(), role = "user", content = message)
+            val pendingAssistant = UiMessage(id = assistantId, role = "assistant", content = "", pending = true)
+            saveConversation(
+                current.copy(
+                    title = if (current.messages.isEmpty()) ConversationStore.titleFromMessage(message) else current.title,
+                    messages = current.messages + listOf(userMessage, pendingAssistant),
+                    updatedAt = System.currentTimeMillis(),
+                ),
+            )
+
+            runCatching {
+                orchestrator.runTurn(session, message)
+            }.onSuccess { result ->
+                val active = activeConversation()
+                val updatedConversation = active?.copy(
+                    messages = active.messages.map {
+                        if (it.id == assistantId) it.copy(content = result.finalText, pending = false) else it
+                    },
+                    medications = session.medicationInputs(),
+                    updatedAt = System.currentTimeMillis(),
+                )
+                if (updatedConversation != null) saveConversation(updatedConversation)
+                _uiState.update { it.copy(trace = result.trace, busy = false) }
+            }.onFailure { error ->
+                val active = activeConversation()
+                val updatedConversation = active?.copy(
+                    messages = active.messages.map {
+                        if (it.id == assistantId) {
+                            it.copy(content = error.message ?: "Request failed", pending = false)
+                        } else {
+                            it
+                        }
+                    },
+                    updatedAt = System.currentTimeMillis(),
+                )
+                if (updatedConversation != null) saveConversation(updatedConversation)
+                _uiState.update { it.copy(busy = false) }
+            }
+        }
+    }
+
+    fun createConversation() {
+        viewModelScope.launch {
+            val next = ConversationStore.newConversation()
+            val current = _uiState.value.conversations
+            conversationStore.save(listOf(next) + current, next.id)
+        }
+    }
+
+    fun selectConversation(id: String) {
+        viewModelScope.launch {
+            conversationStore.save(_uiState.value.conversations, id)
+        }
+    }
+
+    fun deleteConversation(id: String) {
+        viewModelScope.launch {
+            val remaining = _uiState.value.conversations.filterNot { it.id == id }
+            val next = if (remaining.isEmpty()) listOf(ConversationStore.newConversation()) else remaining
+            val nextActive = if (_uiState.value.activeConversationId == id) next.first().id else _uiState.value.activeConversationId
+            conversationStore.save(next, nextActive)
+        }
+    }
+
+    fun enqueueModelDownload() {
+        modelManager.enqueueDownload()
+    }
+
+    fun acknowledgeOcrScaffold() {
+        val conversation = activeConversation() ?: return
+        viewModelScope.launch {
+            saveConversation(
+                conversation.copy(
+                    messages = conversation.messages + UiMessage(
+                        id = java.util.UUID.randomUUID().toString(),
+                        role = "assistant",
+                        content = "OCR manager is scaffolded in the Android app, but the camera capture flow still needs device-side wiring and validation.",
+                    ),
+                    updatedAt = System.currentTimeMillis(),
+                ),
+            )
+        }
+    }
+
+    override fun onCleared() {
+        liteRtProvider?.close()
+        repository?.close()
+        super.onCleared()
+    }
+
+    private suspend fun saveConversation(updated: PersistedConversation) {
+        val conversations = _uiState.value.conversations.map { if (it.id == updated.id) updated else it }
+        conversationStore.save(conversations, updated.id)
+    }
+
+    private fun activeConversation(): PersistedConversation? =
+        _uiState.value.conversations.firstOrNull { it.id == _uiState.value.activeConversationId }
+
+    private suspend fun hydrateSession(conversation: PersistedConversation?) {
+        session.transcript.clear()
+        session.lastTrace.clear()
+        session.lastReport = null
+        session.medications.clear()
+        if (conversation == null) return
+        conversation.messages.forEach { message ->
+            session.transcript += AgentMessage(role = message.role, content = message.content)
+        }
+        repository?.let { repo ->
+            session.medications += repo.normalizeMedications(conversation.medications)
+        }
+    }
+}

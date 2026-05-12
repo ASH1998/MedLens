@@ -1,0 +1,776 @@
+"""
+MedLens training data builder.
+
+One table: medlens.training_examples — Unsloth-compatible chat rows
+with structured provenance for multi-drug interaction fine-tuning.
+
+Usage:
+    # (1) Create/reset the schema + table
+    uv run python data/training_data_builder.py --create-schema
+    uv run python data/training_data_builder.py --create-faers-indexes # (run once to add indexes on FAERS source tables; speeds up multi-drug query by ~10x)
+
+    # (2) Populate from FAERS (multi-drug suspect cases → Type B examples)
+    uv run python data/training_data_builder.py --build-faers --limit 5000 --thinking-mode never
+    uv run python data/training_data_builder.py --build-faers --min-drugs 3 --max-drugs 8
+
+    # (3) Inspect what was loaded
+    uv run python data/training_data_builder.py --stats
+
+    # (4) Export JSONL for Unsloth
+    uv run python data/training_data_builder.py --export data/medlens_train.jsonl
+
+DrugBank / synthetic / agentic example generators are stubbed — plug in later.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+from contextlib import closing
+from itertools import combinations
+from pathlib import Path
+
+from dotenv import load_dotenv
+import psycopg
+import tiktoken
+from psycopg import sql
+from psycopg.types.json import Json  # kept for potential future use
+
+CHUNK_SIZE = 2000  # rows fetched + inserted per batch
+
+# cl100k_base is GPT-4's BPE — not Gemma's, but within ~10% for English medical
+# text and has no model download. Good enough for filtering/bucketing decisions.
+# Swap for the real Gemma tokenizer later if needed.
+_ENCODER = tiktoken.get_encoding("cl100k_base")
+
+
+def count_tokens(text: str) -> int:
+    return len(_ENCODER.encode(text or ""))
+
+
+def count_message_tokens(messages: list[dict]) -> int:
+    return sum(count_tokens(m.get("content", "")) for m in messages)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = Path(__file__).resolve().parent
+
+load_dotenv(PROJECT_ROOT / ".env")
+POSTGRES_URI = os.getenv("POSTGRES_URI")
+SCHEMA = "medlens"
+TABLE = "training_examples"
+
+# ── severity map from FAERS outc_cod → MedLens severity buckets ──────────
+# (from CLAUDE.md: DE/LT/HO=Major, DS/CA/RI=Moderate, OT=Minor)
+OUTC_TO_SEVERITY = {
+    "DE": "Major", "LT": "Major", "HO": "Major",
+    "DS": "Moderate", "CA": "Moderate", "RI": "Moderate",
+    "OT": "Minor",
+}
+SEVERITY_RANK = {"Major": 3, "Moderate": 2, "Minor": 1, "None": 0}
+DEFAULT_THINKING_MODE = "never"
+PROMPT_VARIANTS = ("narrative", "review_request", "symptom_first", "medication_check")
+ANSWER_VARIANTS = ("structured", "concise", "clinical_note", "risk_screen")
+ACTION_BY_SEVERITY = {
+    "Major": "Urgent medication review is warranted.",
+    "Moderate": "Prompt medication review is warranted.",
+    "Minor": "Medication review is reasonable, especially if symptoms continue.",
+    "None": "No strong interaction signal is evident from this case alone.",
+}
+HEADLINE_BY_SEVERITY = {
+    "Major": "MAJOR interaction risk.",
+    "Moderate": "MODERATE interaction risk.",
+    "Minor": "MINOR interaction risk.",
+    "None": "No strong interaction signal.",
+}
+
+# ── DDL ──────────────────────────────────────────────────────────────────
+
+DDL_SCHEMA = f"CREATE SCHEMA IF NOT EXISTS {SCHEMA};"
+
+DDL_DROP = f"DROP TABLE IF EXISTS {SCHEMA}.{TABLE} CASCADE;"
+
+DDL_TABLE = f"""
+CREATE TABLE {SCHEMA}.{TABLE} (
+    id              BIGSERIAL PRIMARY KEY,
+
+    example_type    TEXT NOT NULL,          -- single_ddi | multi_drug | agentic_followup
+    source          TEXT NOT NULL,          -- faers | drugbank | openfda_label | synthetic
+    source_ref      TEXT,                   -- FAERS primaryid, DrugBank pair id, etc.
+
+    -- drug payload (normalized generics)
+    drugs           JSONB NOT NULL,         -- ["warfarin","ibuprofen",...]
+    n_drugs         INT NOT NULL,
+    pairs           JSONB,                  -- [["ibuprofen","warfarin"], ...]  sorted tuples
+    n_pairs         INT,
+
+    -- clinical payload
+    reactions       JSONB,                  -- MedDRA PT list
+    indications     JSONB,                  -- INDI.indi_pt list
+    outcome_codes   JSONB,                  -- FAERS outc_cod array
+    severity        TEXT,                   -- Major | Moderate | Minor | None
+    mechanisms      JSONB,                  -- per-pair mechanism (DrugBank); null until enriched
+
+    -- demographics
+    age             TEXT,
+    sex             TEXT,
+
+    -- chat payload (Unsloth format)
+    messages        JSONB NOT NULL,
+    n_turns         INT NOT NULL,
+    has_think       BOOLEAN DEFAULT false,
+    think_trace     TEXT,
+
+    -- ops
+    token_count           INT,    -- total tokens in `messages` payload
+    thinking_token_count  INT,    -- tokens inside the <|think|> block only
+    quality_score         REAL,
+    split           TEXT DEFAULT 'train',
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+"""
+
+DDL_INDEXES = [
+    f"CREATE INDEX ON {SCHEMA}.{TABLE} (example_type);",
+    f"CREATE INDEX ON {SCHEMA}.{TABLE} (severity);",
+    f"CREATE INDEX ON {SCHEMA}.{TABLE} (n_drugs);",
+    f"CREATE INDEX ON {SCHEMA}.{TABLE} (split);",
+    f"CREATE INDEX ON {SCHEMA}.{TABLE} (source);",
+    f"CREATE INDEX ON {SCHEMA}.{TABLE} USING GIN (drugs);",
+    f"CREATE INDEX ON {SCHEMA}.{TABLE} USING GIN (pairs);",
+    f"CREATE INDEX ON {SCHEMA}.{TABLE} USING GIN (reactions);",
+]
+
+
+def require_uri() -> str:
+    if not POSTGRES_URI:
+        raise RuntimeError("POSTGRES_URI not set in .env")
+    return POSTGRES_URI
+
+
+def create_schema() -> None:
+    """Drop + recreate medlens.training_examples. Destructive."""
+    uri = require_uri()
+    with closing(psycopg.connect(uri)) as conn:
+        with conn.cursor() as cur:
+            cur.execute(DDL_SCHEMA)
+            cur.execute(DDL_DROP)
+            cur.execute(DDL_TABLE)
+            for ddl in DDL_INDEXES:
+                cur.execute(ddl)
+        conn.commit()
+    print(f"Created {SCHEMA}.{TABLE} (dropped if existed).")
+
+
+# Indexes on faers source tables — only needed once; massively speeds up
+# the multi-CTE SELECT (all joins are on primaryid; drug has a large filter).
+FAERS_INDEX_DDLS = [
+    # drug: partial index covering the WHERE + GROUP BY + INCLUDE for prod_ai
+    """CREATE INDEX IF NOT EXISTS faers_drug_suspect_idx
+       ON faers.drug (primaryid)
+       INCLUDE (prod_ai)
+       WHERE role_cod IN ('PS','SS','I')
+         AND prod_ai IS NOT NULL
+         AND prod_ai <> '';""",
+    # join targets — all keyed on primaryid
+    "CREATE INDEX IF NOT EXISTS faers_reac_pid_idx ON faers.reac (primaryid);",
+    "CREATE INDEX IF NOT EXISTS faers_indi_pid_idx ON faers.indi (primaryid);",
+    "CREATE INDEX IF NOT EXISTS faers_outc_pid_idx ON faers.outc (primaryid);",
+    "CREATE INDEX IF NOT EXISTS faers_demo_pid_idx ON faers.demo (primaryid);",
+]
+
+
+def create_faers_indexes() -> None:
+    """Add indexes to faers source tables. Safe to re-run (IF NOT EXISTS)."""
+    uri = require_uri()
+    with closing(psycopg.connect(uri)) as conn:
+        for ddl in FAERS_INDEX_DDLS:
+            name = ddl.split("faers_")[1].split(" ")[0] if "faers_" in ddl else "?"
+            print(f"  Creating index faers_{name} …", end=" ", flush=True)
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+            conn.commit()
+            print("done")
+    print("All faers indexes created.")
+
+
+# ── FAERS → Type B multi-drug examples ───────────────────────────────────
+
+FAERS_CASE_QUERY = """
+WITH suspect AS (
+    SELECT primaryid,
+           array_agg(DISTINCT LOWER(prod_ai) ORDER BY LOWER(prod_ai)) AS drugs
+    FROM faers.drug
+    WHERE role_cod IN ('PS','SS','I')
+      AND prod_ai IS NOT NULL
+      AND prod_ai <> ''
+    GROUP BY primaryid
+    HAVING COUNT(DISTINCT prod_ai) BETWEEN %(min_drugs)s AND %(max_drugs)s
+    ORDER BY primaryid
+    LIMIT %(limit)s
+),
+-- only aggregate rows matching suspect primaryids (not full tables)
+reacs AS (
+    SELECT r.primaryid, array_agg(DISTINCT r.pt) AS reactions
+    FROM faers.reac r
+    WHERE r.pt IS NOT NULL
+      AND r.primaryid IN (SELECT primaryid FROM suspect)
+    GROUP BY r.primaryid
+),
+indis AS (
+    SELECT i.primaryid, array_agg(DISTINCT i.indi_pt) AS indications
+    FROM faers.indi i
+    WHERE i.indi_pt IS NOT NULL AND i.indi_pt <> ''
+      AND i.primaryid IN (SELECT primaryid FROM suspect)
+    GROUP BY i.primaryid
+),
+outcs AS (
+    SELECT o.primaryid, array_agg(DISTINCT o.outc_cod) AS outcome_codes
+    FROM faers.outc o
+    WHERE o.outc_cod IS NOT NULL
+      AND o.primaryid IN (SELECT primaryid FROM suspect)
+    GROUP BY o.primaryid
+)
+SELECT s.primaryid,
+       s.drugs,
+       r.reactions,
+       i.indications,
+       o.outcome_codes,
+       d.age, d.age_cod, d.sex
+FROM suspect s
+LEFT JOIN reacs r USING (primaryid)
+LEFT JOIN indis i USING (primaryid)
+LEFT JOIN outcs o USING (primaryid)
+LEFT JOIN faers.demo d ON d.primaryid = s.primaryid
+WHERE r.reactions IS NOT NULL
+ORDER BY s.primaryid;
+"""
+
+
+def severity_from_outcomes(outcome_codes: list[str] | None) -> str:
+    if not outcome_codes:
+        return "None"
+    best = "None"
+    for code in outcome_codes:
+        sev = OUTC_TO_SEVERITY.get(code, "None")
+        if SEVERITY_RANK[sev] > SEVERITY_RANK[best]:
+            best = sev
+    return best
+
+
+def build_pairs(drugs: list[str]) -> list[list[str]]:
+    return [list(p) for p in combinations(sorted(drugs), 2)]
+
+
+def format_age(age: str | None, age_cod: str | None) -> str | None:
+    if not age:
+        return None
+    unit_map = {"YR": "year-old", "MON": "month-old", "WK": "week-old",
+                "DY": "day-old", "HR": "hour-old", "DEC": "decade-old"}
+    unit = unit_map.get((age_cod or "").upper(), "")
+    return f"{age} {unit}".strip() if unit else age
+
+
+def _stable_index(seed: str, modulo: int) -> int:
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % modulo
+
+
+def _stable_pick(seed: str, options: tuple[str, ...]) -> str:
+    return options[_stable_index(seed, len(options))]
+
+
+def _include_think(seed: str, thinking_mode: str) -> bool:
+    if thinking_mode == "always":
+        return True
+    if thinking_mode == "never":
+        return False
+    return _stable_index(seed + ":think", 100) < 25
+
+
+def _build_patient_strings(age: str | None, sex: str | None) -> tuple[str, str, str]:
+    sex_map = {"M": "male", "F": "female"}
+    sex_str = sex_map.get((sex or "").upper(), "")
+
+    patient_parts = []
+    if age:
+        patient_parts.append(f"a {age}")
+    if sex_str:
+        patient_parts.append(sex_str)
+    patient_desc = " ".join(patient_parts) if patient_parts else "a patient"
+
+    demo_bits = []
+    if age:
+        demo_bits.append(f"age: {age}")
+    if sex_str:
+        demo_bits.append(f"sex: {sex_str}")
+    demo_str = f" ({', '.join(demo_bits)})" if demo_bits else ""
+    return sex_str, patient_desc, demo_str
+
+
+def _render_user_message(
+    drugs: list[str],
+    reactions: list[str],
+    indications: list[str] | None,
+    patient_desc: str,
+    variant: str,
+) -> str:
+    drug_text = ", ".join(drugs)
+    reaction_text = ", ".join(reactions[:5])
+    indication_text = ", ".join(indications[:3]) if indications else ""
+
+    if variant == "review_request":
+        parts = ["Review this medication regimen for interaction risk."]
+        if patient_desc != "a patient":
+            parts.append(f"Patient: {patient_desc}.")
+        parts.append(f"Medications: {drug_text}.")
+        if indication_text:
+            parts.append(f"Indications: {indication_text}.")
+        parts.append(f"Symptoms: {reaction_text}.")
+        parts.append("Give the likely interaction severity and why it stands out.")
+        return " ".join(parts)
+
+    if variant == "symptom_first":
+        parts = [f"I have been dealing with {reaction_text}."]
+        if patient_desc != "a patient":
+            parts.append(f"I am {patient_desc}.")
+        parts.append(f"My medications are {drug_text}.")
+        if indication_text:
+            parts.append(f"I take them for {indication_text}.")
+        parts.append("Which interaction pattern is most concerning here?")
+        return " ".join(parts)
+
+    if variant == "medication_check":
+        lines = ["Medication interaction check"]
+        if patient_desc != "a patient":
+            lines.append(f"Patient: {patient_desc}")
+        lines.append(f"Current drugs: {drug_text}")
+        if indication_text:
+            lines.append(f"Indications: {indication_text}")
+        lines.append(f"Reported symptoms: {reaction_text}")
+        lines.append("Question: Is this regimen high risk for a drug interaction?")
+        return "\n".join(lines)
+
+    ind_str = f" I take them for {indication_text}." if indication_text else ""
+    return (
+        f"I'm {patient_desc}. I currently take: "
+        f"{drug_text}.{ind_str} "
+        f"I've been experiencing: {reaction_text}. "
+        f"Are any of these drugs interacting?"
+    )
+
+
+def _build_think_trace(
+    drugs: list[str],
+    reactions: list[str],
+    severity: str,
+    demo_str: str,
+) -> str:
+    return (
+        f"Assess regimen-level interaction risk{demo_str}. "
+        f"Drugs: {', '.join(drugs)}. "
+        f"Reported events: {', '.join(reactions[:5])}. "
+        f"FAERS severity bucket: {severity}. "
+        f"Answer directly, avoid boilerplate, and keep the output concrete."
+    )
+
+
+def _render_assistant_message(
+    drugs: list[str],
+    reactions: list[str],
+    severity: str,
+    n_pairs: int,
+    variant: str,
+    think: str | None,
+) -> str:
+    drug_text = ", ".join(drugs)
+    reaction_text = ", ".join(reactions[:5])
+    severity_lower = severity.lower()
+    headline = HEADLINE_BY_SEVERITY[severity]
+    action = ACTION_BY_SEVERITY[severity]
+
+    if severity == "None":
+        evidence_line = "This case does not show a strong interaction signal from FAERS alone."
+    else:
+        evidence_line = (
+            f"This regimen matches a {severity_lower} multi-drug adverse-event signal in FAERS."
+        )
+
+    limitation_line = (
+        f"FAERS supports the regimen-level signal across {n_pairs} possible drug pairs, "
+        f"but it does not isolate one confirmed causal pair."
+    )
+
+    if variant == "concise":
+        body = (
+            f"{headline} {evidence_line} Reported events: {reaction_text}. "
+            f"Regimen reviewed: {drug_text}. {limitation_line} {action}"
+        )
+    elif variant == "clinical_note":
+        body = (
+            f"Impression: {headline}\n"
+            f"Key findings: {reaction_text} while taking {drug_text}.\n"
+            f"Evidence basis: {evidence_line}\n"
+            f"Interpretation: {limitation_line}\n"
+            f"Priority: {action}"
+        )
+    elif variant == "risk_screen":
+        body = (
+            f"Overall risk: {severity}\n"
+            f"- Regimen reviewed: {drug_text}\n"
+            f"- Reported events: {reaction_text}\n"
+            f"- Signal: {evidence_line}\n"
+            f"- Limitation: {limitation_line}\n"
+            f"- Priority: {action}"
+        )
+    else:
+        body = (
+            f"{headline}\n\n"
+            f"Medications reviewed: {drug_text}\n"
+            f"Reported events: {reaction_text}\n"
+            f"Interpretation: {evidence_line}\n"
+            f"Confidence note: {limitation_line}\n"
+            f"Priority: {action}"
+        )
+
+    if think:
+        return f"<|think|>{think}</think>\n\n{body}"
+    return body
+
+
+def render_messages_type_b(
+    source_ref: str,
+    drugs: list[str],
+    reactions: list[str],
+    indications: list[str] | None,
+    severity: str,
+    age: str | None,
+    sex: str | None,
+    thinking_mode: str = DEFAULT_THINKING_MODE,
+) -> tuple[list[dict], str]:
+    """Build varied Unsloth-format messages with optional think traces."""
+    n = len(drugs)
+    n_pairs = n * (n - 1) // 2
+    seed = f"{source_ref}:{'|'.join(drugs)}:{severity}:{n}"
+    _, patient_desc, demo_str = _build_patient_strings(age, sex)
+    prompt_variant = _stable_pick(seed + ":prompt", PROMPT_VARIANTS)
+    answer_variant = _stable_pick(seed + ":answer", ANSWER_VARIANTS)
+    include_think = _include_think(seed, thinking_mode)
+
+    user_msg = _render_user_message(drugs, reactions, indications, patient_desc, prompt_variant)
+    think = _build_think_trace(drugs, reactions, severity, demo_str) if include_think else ""
+    assistant_msg = _render_assistant_message(
+        drugs,
+        reactions,
+        severity,
+        n_pairs,
+        answer_variant,
+        think if include_think else None,
+    )
+
+    messages = [
+        {"role": "user", "content": user_msg},
+        {"role": "assistant", "content": assistant_msg},
+    ]
+    return messages, think
+
+
+INSERT_COLS = (
+    "example_type", "source", "source_ref",
+    "drugs", "n_drugs", "pairs", "n_pairs",
+    "reactions", "indications", "outcome_codes", "severity",
+    "age", "sex",
+    "messages", "n_turns", "has_think", "think_trace",
+    "token_count", "thinking_token_count",
+    "split",
+)
+
+INSERT_SQL = f"""
+INSERT INTO {SCHEMA}.{TABLE} ({', '.join(INSERT_COLS)})
+VALUES ({', '.join('%s' for _ in INSERT_COLS)});
+"""
+
+
+def _bulk_insert(conn, records: list[tuple]) -> None:
+    """Use COPY for bulk insert — 10-50x faster than executemany."""
+    if not records:
+        return
+    col_list = ", ".join(INSERT_COLS)
+    with conn.cursor() as cur:
+        with cur.copy(f"COPY {SCHEMA}.{TABLE} ({col_list}) FROM STDIN") as copy:
+            for rec in records:
+                copy.write_row(rec)
+    conn.commit()
+
+
+def _row_to_record(
+    row: tuple, min_drugs: int, thinking_mode: str
+) -> tuple | None:
+    """Convert one FAERS result row → INSERT tuple, or None if filtered out."""
+    primaryid, drugs, reactions, indications, outcome_codes, age, age_cod, sex = row
+    drugs = [d for d in (drugs or []) if d]
+    reactions = [r for r in (reactions or []) if r]
+    if len(drugs) < min_drugs or not reactions:
+        return None
+
+    pairs = build_pairs(drugs)
+    severity = severity_from_outcomes(outcome_codes)
+    age_str = format_age(age, age_cod)
+    messages, think = render_messages_type_b(
+        str(primaryid), drugs, reactions, indications, severity, age_str, sex, thinking_mode,
+    )
+    tok_total = count_message_tokens(messages)
+    has_think = bool(think)
+    tok_think = count_tokens(think) if has_think else None
+    return (
+        "multi_drug", "faers", str(primaryid),
+        json.dumps(drugs), len(drugs), json.dumps(pairs), len(pairs),
+        json.dumps(reactions), json.dumps(indications or []),
+        json.dumps(outcome_codes or []), severity,
+        age_str, sex,
+        json.dumps(messages), len(messages), has_think, think or None,
+        tok_total, tok_think,
+        "train",
+    )
+
+
+STREAM_THRESHOLD = 20_000  # above this, use ServerCursor + chunks; below, single-shot
+
+
+def build_from_faers(
+    limit: int,
+    min_drugs: int,
+    max_drugs: int,
+    batch_size: int = CHUNK_SIZE,
+    thinking_mode: str = DEFAULT_THINKING_MODE,
+) -> int:
+    """
+    Two modes:
+      • limit <= STREAM_THRESHOLD: client cursor + single executemany
+        (fastest for small batches — psycopg3 pipeline fast path kicks in)
+      • limit  > STREAM_THRESHOLD: ServerCursor + chunked inserts across
+        two connections (keeps memory flat when pulling all cases)
+    """
+    uri = require_uri()
+    inserted = 0
+    skipped = 0
+
+    # ── small batch: simple path ─────────────────────────────────────────
+    if limit <= STREAM_THRESHOLD:
+        with closing(psycopg.connect(uri)) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    FAERS_CASE_QUERY,
+                    {"limit": limit, "min_drugs": min_drugs, "max_drugs": max_drugs},
+                )
+                rows = cur.fetchall()
+            print(f"Fetched {len(rows):,} candidate FAERS cases.")
+
+            records = []
+            for row in rows:
+                rec = _row_to_record(row, min_drugs, thinking_mode)
+                if rec is None:
+                    skipped += 1
+                else:
+                    records.append(rec)
+
+            _bulk_insert(conn, records)
+            inserted = len(records)
+
+        print(f"Inserted {inserted:,} FAERS multi-drug training examples "
+              f"({skipped:,} skipped).")
+        return inserted
+
+    # ── large batch: streaming path (two connections) ────────────────────
+    with closing(psycopg.connect(uri)) as reader_conn, \
+         closing(psycopg.connect(uri)) as writer_conn:
+
+        chunk: list[tuple] = []
+
+        def flush_chunk() -> None:
+            nonlocal inserted
+            if not chunk:
+                return
+            _bulk_insert(writer_conn, chunk)
+            inserted += len(chunk)
+            chunk.clear()
+            print(f"  … {inserted:,} inserted so far", end="\r", flush=True)
+
+        with psycopg.ServerCursor(reader_conn, "faers_stream") as reader:
+            reader.itersize = batch_size
+            reader.execute(
+                FAERS_CASE_QUERY,
+                {"limit": limit, "min_drugs": min_drugs, "max_drugs": max_drugs},
+            )
+            for row in reader:
+                record = _row_to_record(row, min_drugs, thinking_mode)
+                if record is None:
+                    skipped += 1
+                    continue
+                chunk.append(record)
+                if len(chunk) >= batch_size:
+                    flush_chunk()
+
+        flush_chunk()
+
+    print(f"\nInserted {inserted:,} FAERS multi-drug training examples "
+          f"({skipped:,} skipped — too few drugs or no reactions).")
+    return inserted
+
+
+# ── stats ─────────────────────────────────────────────────────────────────
+
+def stats() -> None:
+    uri = require_uri()
+    with closing(psycopg.connect(uri)) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.{TABLE};")
+            total = cur.fetchone()[0]
+            print(f"\nTotal examples: {total:,}")
+
+            if total == 0:
+                return
+
+            cur.execute(f"""
+                SELECT example_type, source, severity, COUNT(*)
+                FROM {SCHEMA}.{TABLE}
+                GROUP BY example_type, source, severity
+                ORDER BY COUNT(*) DESC;
+            """)
+            print("\nBy type / source / severity:")
+            for t, s, sev, c in cur.fetchall():
+                print(f"  {t:20s} | {s:10s} | {sev or 'null':9s} | {c:>8,}")
+
+            cur.execute(f"""
+                SELECT n_drugs, COUNT(*)
+                FROM {SCHEMA}.{TABLE}
+                GROUP BY n_drugs ORDER BY n_drugs;
+            """)
+            print("\nBy drug count:")
+            for n, c in cur.fetchall():
+                print(f"  {n:>2} drugs: {c:>8,}")
+
+            cur.execute(f"""
+                SELECT split, COUNT(*) FROM {SCHEMA}.{TABLE}
+                GROUP BY split ORDER BY split;
+            """)
+            print("\nBy split:")
+            for s, c in cur.fetchall():
+                print(f"  {s:8s}: {c:>8,}")
+
+            cur.execute(f"""
+                SELECT has_think, COUNT(*)
+                FROM {SCHEMA}.{TABLE}
+                GROUP BY has_think
+                ORDER BY has_think DESC;
+            """)
+            print("\nBy think usage:")
+            for has_think, c in cur.fetchall():
+                label = "with_think" if has_think else "no_think"
+                print(f"  {label:10s}: {c:>8,}")
+
+            cur.execute(f"""
+                SELECT
+                    MIN(token_count), ROUND(AVG(token_count)::numeric, 1),
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY token_count),
+                    percentile_cont(0.95) WITHIN GROUP (ORDER BY token_count),
+                    MAX(token_count),
+                    ROUND(AVG(thinking_token_count)::numeric, 1),
+                    MAX(thinking_token_count)
+                FROM {SCHEMA}.{TABLE}
+                WHERE token_count IS NOT NULL;
+            """)
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                mn, avg, p50, p95, mx, avg_think, mx_think = row
+                print("\nToken stats (messages total):")
+                print(f"  min={mn}  avg={avg}  p50={p50:.0f}  p95={p95:.0f}  max={mx}")
+                print(f"  think avg={avg_think}  think max={mx_think}")
+
+
+# ── export ────────────────────────────────────────────────────────────────
+
+def export_jsonl(out_path: Path, split: str | None = None) -> None:
+    uri = require_uri()
+    where = ""
+    params: tuple = ()
+    if split:
+        where = "WHERE split = %s"
+        params = (split,)
+
+    with closing(psycopg.connect(uri)) as conn, open(out_path, "w") as f:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT messages FROM {SCHEMA}.{TABLE} {where} ORDER BY id;",
+                params,
+            )
+            count = 0
+            for (messages,) in cur:
+                f.write(json.dumps({"messages": messages}) + "\n")
+                count += 1
+    print(f"Exported {count:,} rows → {out_path}")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="MedLens training data builder")
+    p.add_argument("--create-schema", action="store_true",
+                   help="Drop + recreate medlens.training_examples")
+    p.add_argument("--create-faers-indexes", action="store_true",
+                   help="Add indexes on faers source tables (run once before --build-faers)")
+    p.add_argument("--build-faers", action="store_true",
+                   help="Populate Type B multi-drug examples from FAERS")
+    p.add_argument("--limit", type=int, default=5000000,
+                   help="Max FAERS cases to pull (default: 5,000,000)")
+    p.add_argument("--min-drugs", type=int, default=3)
+    p.add_argument("--max-drugs", type=int, default=8)
+    p.add_argument("--thinking-mode", choices=["never", "mixed", "always"],
+                   default=DEFAULT_THINKING_MODE,
+                   help="Whether assistant labels include <|think|> blocks")
+    p.add_argument("--batch-size", type=int, default=CHUNK_SIZE,
+                   help=f"Rows per insert batch (default: {CHUNK_SIZE})")
+    p.add_argument("--stats", action="store_true")
+    p.add_argument("--export", metavar="PATH",
+                   help="Export messages to JSONL at PATH")
+    p.add_argument("--split", default=None,
+                   help="Optional split filter for --export (train/val/test)")
+    args = p.parse_args()
+
+    did_something = False
+
+    if args.create_schema:
+        create_schema()
+        did_something = True
+
+    if args.create_faers_indexes:
+        create_faers_indexes()
+        did_something = True
+
+    if args.build_faers:
+        build_from_faers(
+            args.limit,
+            args.min_drugs,
+            args.max_drugs,
+            args.batch_size,
+            args.thinking_mode,
+        )
+        did_something = True
+
+    if args.stats:
+        stats()
+        did_something = True
+
+    if args.export:
+        export_jsonl(Path(args.export), split=args.split)
+        did_something = True
+
+    if not did_something:
+        p.print_help()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

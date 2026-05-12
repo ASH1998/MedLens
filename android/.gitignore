@@ -1,0 +1,40 @@
+# Gradle and build
+.gradle/
+.transforms/
+build/
+*/build/
+*.apk
+*.aab
+
+# Local development
+local.properties
+gradle.properties.local
+
+# IDE and Editor
+.idea/
+*.iml
+.kotlin/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS and Windows
+.DS_Store
+Thumbs.db
+
+# Android specific
+.cxx/
+.lint/
+lint-results*
+captures/
+
+# Profiling and debugging
+*.hprof
+*.trace
+
+# Keystore files (signing keys)
+*.jks
+*.keystore
+*.pk8
+*.x509.pem

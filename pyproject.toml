@@ -1,15 +1,51 @@
 [project]
 name = "medlens"
 version = "0.0.1.dev0"
-description = "An on-device polypharmacy drug interaction agent powered by fine-tuned Gemma 4 E2B"
+description = "An on-device medication safety agent powered by Gemma and local evidence tools"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11, <3.13"
 authors = [
     { name = "Ashutosh", email = "prog.mishra@gmail.com" },
 ]
 dependencies = [
+    "bitsandbytes>=0.49.2",
+    "deepspeed>=0.18.9",
+    "imbalanced-learn>=0.14.1",
+    "joblib>=1.5.3",
+    "kaggle>=2.0.1",
+    "lightgbm>=4.6.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.3",
+    "optimum==1.24.0",
     "pandas>=3.0.2",
     "psycopg[binary]>=3.3.3",
     "python-dotenv",
+    "prompt_toolkit>=3.0.52",
+    "pytorch-tokenizers>=1.2.0",
+    "rich>=14.2.0",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.1",
+    "tiktoken>=0.12.0",
+    "torch==2.10.0",
+    "torchao==0.15.0",
+    "transformers==5.5.0",
+    "trl>=0.10.1",
+    "unsloth==2026.4.6",
+    "unsloth-zoo==2026.4.8",
     "uv>=0.11.6",
+    "xgboost>=3.2.0",
 ]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu128"
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+
+[project.scripts]
+medlens-report = "medlens.cli:main"
+medlens-agent = "medlens.cli:main"
+"medlens.cli" = "medlens.cli:main"
