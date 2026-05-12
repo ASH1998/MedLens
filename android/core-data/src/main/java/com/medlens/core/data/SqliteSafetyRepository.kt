@@ -34,37 +34,63 @@ class SqliteSafetyRepository(
             val db = normalizationDb()
             names.map { name ->
                 val normalizedInput = normalizeLookupText(name)
-                db.rawQuery(
-                    """
-                    SELECT d.id AS id, d.canonical_name AS canonical_name, a.alias AS alias
-                    FROM drug_alias a
-                    JOIN drug d ON d.id = a.drug_id
-                    WHERE a.normalized_alias = ?
-                    """.trimIndent(),
-                    arrayOf(normalizedInput),
-                ).use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        NormalizedMedication(
-                            input_name = name,
-                            normalized_input = normalizedInput,
-                            canonical_name = cursor.string("canonical_name"),
-                            drug_id = cursor.long("id"),
-                            matched_alias = cursor.string("alias"),
-                            resolved = true,
-                        )
-                    } else {
-                        NormalizedMedication(
-                            input_name = name,
-                            normalized_input = normalizedInput,
-                            canonical_name = null,
-                            drug_id = null,
-                            matched_alias = null,
-                            resolved = false,
-                        )
-                    }
+                val match = normalizationCandidates(normalizedInput).firstNotNullOfOrNull { candidate ->
+                    lookupAlias(db, candidate)
+                }
+                if (match != null) {
+                    NormalizedMedication(
+                        input_name = name,
+                        normalized_input = normalizedInput,
+                        canonical_name = match.canonicalName,
+                        drug_id = match.drugId,
+                        matched_alias = match.alias,
+                        resolved = true,
+                    )
+                } else {
+                    NormalizedMedication(
+                        input_name = name,
+                        normalized_input = normalizedInput,
+                        canonical_name = null,
+                        drug_id = null,
+                        matched_alias = null,
+                        resolved = false,
+                    )
                 }
             }
         }
+
+    private fun lookupAlias(db: SQLiteDatabase, normalizedInput: String): AliasLookup? =
+        db.rawQuery(
+            """
+            SELECT d.id AS id, d.canonical_name AS canonical_name, a.alias AS alias
+            FROM drug_alias a
+            JOIN drug d ON d.id = a.drug_id
+            WHERE a.normalized_alias = ?
+            """.trimIndent(),
+            arrayOf(normalizedInput),
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            AliasLookup(
+                drugId = cursor.long("id"),
+                canonicalName = cursor.string("canonical_name"),
+                alias = cursor.string("alias"),
+            )
+        }
+
+    private fun normalizationCandidates(normalizedInput: String): List<String> {
+        if (normalizedInput.isBlank()) return emptyList()
+        val candidates = linkedSetOf(normalizedInput)
+        val spacedDose = normalizedInput
+            .replace(Regex("([a-z])([0-9])"), "$1 $2")
+            .replace(Regex("([0-9])([a-z])"), "$1 $2")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        candidates += spacedDose
+        candidates += spacedDose
+            .replace(Regex("\\s+(mg|mcg|g|ml|iu)$"), "")
+            .trim()
+        return candidates.filter { it.isNotBlank() }
+    }
 
     override suspend fun searchDrugAliases(query: String, limit: Int): List<AliasSearchResult> =
         withContext(Dispatchers.IO) {
@@ -358,12 +384,12 @@ class SqliteSafetyRepository(
             }
         }
 
-        val fallback = if (matches.isEmpty()) searchCommonMedicines(name, limit = limit) else emptyList()
+        val profileSearchMatches = if (matches.isEmpty()) searchCommonMedicines(name, limit = limit) else emptyList()
         CommonMedicineProfile(
             query = name,
             normalized = normalized,
             aliases = aliases.distinct(),
-            matches = if (matches.isEmpty()) fallback else matches,
+            matches = if (matches.isEmpty()) profileSearchMatches else matches,
         )
     }
 
@@ -663,7 +689,7 @@ class SqliteSafetyRepository(
         findings: List<KnownInteraction>,
     ): List<String> {
         val items = mutableListOf(
-            "This report uses local DDI reference signals only; it is a screening output, not patient-specific medical advice.",
+            "This report uses curated DDI reference signals; it is a screening output, not patient-specific medical advice.",
         )
         if (unresolved.isNotEmpty()) {
             items += "Some medications could not be normalized and were not checked: ${unresolved.joinToString(", ") { it.input_name }}."
@@ -672,7 +698,7 @@ class SqliteSafetyRepository(
             items += "Fewer than two medications were resolved, so no pairwise interaction check was possible."
         }
         if (findings.isEmpty() && checkedPairCount > 0) {
-            items += "No known/reference DDI signal was found locally for the resolved medication pairs."
+            items += "No known/reference DDI signal was found for the resolved medication pairs."
         }
         return items
     }
@@ -713,6 +739,12 @@ class SqliteSafetyRepository(
         val where: String,
         val params: List<String>,
         val needsEffectJoin: Boolean,
+    )
+
+    private data class AliasLookup(
+        val drugId: Long,
+        val canonicalName: String,
+        val alias: String,
     )
 }
 
