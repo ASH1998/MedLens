@@ -1,0 +1,10 @@
+{
+  "name": "MedLens",
+  "short_name": "MedLens",
+  "description": "Offline-first medication safety with deterministic local evidence.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1020",
+  "theme_color": "#0b1020",
+  "icons": []
+}
