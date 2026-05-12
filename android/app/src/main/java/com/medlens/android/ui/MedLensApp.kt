@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -20,12 +22,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Medication
 import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Send
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -37,6 +40,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -48,10 +52,15 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.medlens.android.data.LiteRtBackendPref
 import com.medlens.android.data.PersistedConversation
 import com.medlens.android.model.GEMMA_4_E4B_DESCRIPTOR
 import com.medlens.android.model.ModelState
@@ -191,17 +200,9 @@ private fun ChatShell(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        val meds = activeConversation(state)?.medications.orEmpty()
-                        if (meds.isNotEmpty()) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                meds.take(4).forEach { med ->
-                                    AssistChip(onClick = {}, label = { Text(med) })
-                                }
-                            }
-                        }
                         Row(verticalAlignment = Alignment.Bottom) {
+                            val canSend = !state.busy && draft.isNotBlank() && state.modelState is ModelState.Ready
                             IconButton(onClick = viewModel::acknowledgeOcrScaffold) {
                                 Icon(Icons.Outlined.Search, contentDescription = "Scan")
                             }
@@ -210,7 +211,7 @@ private fun ChatShell(
                                 value = draft,
                                 onValueChange = { draft = it },
                                 modifier = Modifier.weight(1f),
-                                placeholder = { Text("Ask about medications...") },
+                                placeholder = { Text(if (state.modelState is ModelState.Ready) "Ask about medications..." else "Download Gemma to chat") },
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             IconButton(
@@ -219,7 +220,7 @@ private fun ChatShell(
                                     draft = ""
                                     viewModel.sendMessage(text)
                                 },
-                                enabled = !state.busy && draft.isNotBlank(),
+                                enabled = canSend,
                             ) {
                                 Icon(Icons.Outlined.Send, contentDescription = "Send")
                             }
@@ -251,12 +252,52 @@ private fun ChatShell(
                     Button(onClick = viewModel::enqueueModelDownload, enabled = state.modelState !is ModelState.Downloading) {
                         Text("Download Gemma Model")
                     }
+                    Divider()
+                    Text("How technical?", style = MaterialTheme.typography.titleSmall)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(
+                            selected = state.audienceStyle == AudienceStyle.Regular,
+                            onClick = { viewModel.setAudienceStyle(AudienceStyle.Regular) },
+                        )
+                        Text("Regular person")
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(
+                            selected = state.audienceStyle == AudienceStyle.Clinician,
+                            onClick = { viewModel.setAudienceStyle(AudienceStyle.Clinician) },
+                        )
+                        Text("Doctor / clinician")
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(
+                            selected = state.audienceStyle == AudienceStyle.Simple,
+                            onClick = { viewModel.setAudienceStyle(AudienceStyle.Simple) },
+                        )
+                        Text("Simple language")
+                    }
+                    Divider()
+                    Text("LiteRT-LM backend", style = MaterialTheme.typography.titleSmall)
                     Text(
-                        "Bundled artifacts: normalization.sqlite + evidence.mobile.sqlite from data/artifacts.",
-                        style = MaterialTheme.typography.bodyMedium,
+                        "Choose CPU on the Android emulator (its GPU has no OpenCL and the OpenGL delegate is unimplemented). Use GPU on physical devices for speed.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(
+                            selected = state.backendPref == LiteRtBackendPref.CPU,
+                            onClick = { viewModel.setBackendPref(LiteRtBackendPref.CPU) },
+                        )
+                        Text("CPU (emulator-safe)")
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(
+                            selected = state.backendPref == LiteRtBackendPref.GPU,
+                            onClick = { viewModel.setBackendPref(LiteRtBackendPref.GPU) },
+                        )
+                        Text("GPU (physical device)")
+                    }
                     Text(
-                        "The LiteRT-LM model manager is wired for download and local storage. Inference integration still needs Android SDK validation on a real build machine.",
+                        "The LiteRT-LM model manager is wired for download and storage. Inference integration still needs Android SDK validation on a real build machine.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -298,6 +339,14 @@ private fun Sidebar(
             IconButton(onClick = onNew) {
                 Icon(Icons.Outlined.Add, contentDescription = "New")
             }
+        }
+        Button(
+            onClick = onNew,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("New chat")
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(conversations, key = { it.id }) { conversation ->
@@ -374,6 +423,7 @@ private fun ModelStatusCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun MessageBubble(
     role: String,
@@ -381,6 +431,11 @@ private fun MessageBubble(
     pending: Boolean,
 ) {
     val isUser = role == "user"
+    val uriHandler = LocalUriHandler.current
+    val messageText = if (pending && content.isBlank()) "Thinking..." else content
+    val parsed = remember(messageText, isUser) {
+        if (isUser) ParsedAssistantMessage(body = messageText, sources = emptyList()) else parseAssistantMessage(messageText)
+    }
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
@@ -405,21 +460,82 @@ private fun MessageBubble(
                     Text(if (isUser) "You" else "MedLens", style = MaterialTheme.typography.labelMedium)
                 }
                 Text(
-                    if (pending && content.isBlank()) "Thinking..." else content,
+                    markdownBoldText(parsed.body),
                     style = MaterialTheme.typography.bodyMedium,
                 )
+                if (!isUser && parsed.sources.isNotEmpty()) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text("Sources:", style = MaterialTheme.typography.labelMedium)
+                        parsed.sources.forEach { source ->
+                            SourceReferenceText(source = source, onClick = { uriHandler.openUri(source.url) })
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
+private fun SourceReferenceText(
+    source: SourceReference,
+    onClick: () -> Unit,
+) {
+    Text(
+        text = source.label,
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .padding(horizontal = 2.dp, vertical = 1.dp),
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold,
+    )
+}
+
+@Composable
 private fun ToolTraceCard(traceLines: List<String>) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Tool Trace", style = MaterialTheme.typography.titleSmall)
-            traceLines.forEach { line ->
-                Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 2.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                "Tool trace",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "${traceLines.size}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Icon(
+                if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                contentDescription = if (expanded) "Hide tool trace" else "Show tool trace",
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (expanded) {
+            Column(
+                modifier = Modifier.padding(start = 2.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                traceLines.forEach { line ->
+                    Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }
@@ -434,3 +550,57 @@ private fun ModelState.toLabel(): String = when (this) {
     is ModelState.Ready -> "model ready"
     is ModelState.Error -> "model error"
 }
+
+private data class ParsedAssistantMessage(
+    val body: String,
+    val sources: List<SourceReference>,
+)
+
+private data class SourceReference(
+    val label: String,
+    val url: String,
+)
+
+private fun parseAssistantMessage(content: String): ParsedAssistantMessage {
+    val lines = content.lines()
+    val sourceStart = lines.indexOfFirst { line ->
+        line.trim().replace("*", "").equals("Sources:", ignoreCase = true) ||
+            line.trim().replace("*", "").startsWith("Sources:", ignoreCase = true)
+    }
+    if (sourceStart < 0) return ParsedAssistantMessage(content, emptyList())
+
+    val sourceText = lines.drop(sourceStart).joinToString("\n")
+    val urls = URL_REGEX.findAll(sourceText)
+        .map { match -> match.value.trimEnd('.', ',', ';', ')') }
+        .distinct()
+        .take(9)
+        .mapIndexed { index, url -> SourceReference(label = "[${index + 1}]", url = url) }
+        .toList()
+    if (urls.isEmpty()) return ParsedAssistantMessage(content, emptyList())
+
+    val body = lines.take(sourceStart).joinToString("\n").trimEnd()
+    return ParsedAssistantMessage(body = body, sources = urls)
+}
+
+private fun markdownBoldText(value: String): AnnotatedString = buildAnnotatedString {
+    var index = 0
+    while (index < value.length) {
+        val start = value.indexOf("**", index)
+        if (start < 0) {
+            append(value.substring(index))
+            break
+        }
+        append(value.substring(index, start))
+        val end = value.indexOf("**", start + 2)
+        if (end < 0) {
+            append(value.substring(start))
+            break
+        }
+        pushStyle(SpanStyle(fontWeight = FontWeight.Bold))
+        append(value.substring(start + 2, end))
+        pop()
+        index = end + 2
+    }
+}
+
+private val URL_REGEX = Regex("""https?://[^\s)]+""")

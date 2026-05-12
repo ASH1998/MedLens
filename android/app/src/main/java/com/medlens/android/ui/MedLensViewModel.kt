@@ -4,8 +4,10 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.medlens.android.data.ConversationStore
+import com.medlens.android.data.LiteRtBackendPref
 import com.medlens.android.data.PersistedConversation
 import com.medlens.android.data.UiMessage
+import com.medlens.android.litert.LiteRtBackendChoice
 import com.medlens.android.litert.LiteRtLmProvider
 import com.medlens.android.model.GemmaModelManager
 import com.medlens.android.model.ModelState
@@ -37,8 +39,16 @@ data class MedLensUiState(
     val busy: Boolean = false,
     val trace: List<ToolCallRecord> = emptyList(),
     val modelState: ModelState = ModelState.NotDownloaded,
-    val providerLabel: String = "LiteRT-LM scaffold",
+    val providerLabel: String = "Gemma not ready",
+    val backendPref: LiteRtBackendPref = LiteRtBackendPref.CPU,
+    val audienceStyle: AudienceStyle = AudienceStyle.Regular,
 )
+
+enum class AudienceStyle {
+    Regular,
+    Clinician,
+    Simple,
+}
 
 class MedLensViewModel(
     application: Application,
@@ -51,6 +61,8 @@ class MedLensViewModel(
 
     private var repository: SafetyRepository? = null
     private var liteRtProvider: LiteRtLmProvider? = null
+    private var currentModelPath: String? = null
+    private var currentBackend: LiteRtBackendPref = LiteRtBackendPref.CPU
 
     private val _uiState = MutableStateFlow(MedLensUiState())
     val uiState: StateFlow<MedLensUiState> = _uiState.asStateFlow()
@@ -69,14 +81,33 @@ class MedLensViewModel(
         }
         viewModelScope.launch {
             modelManager.observeState().collect { state ->
-                if (state is ModelState.Ready && liteRtProvider == null) {
-                    liteRtProvider = LiteRtLmProvider(appContext, state.path)
-                }
-                if (state !is ModelState.Ready) {
+                if (state is ModelState.Ready) {
+                    currentModelPath = state.path
+                    if (liteRtProvider == null) {
+                        liteRtProvider = LiteRtLmProvider(appContext, state.path, currentBackend.toChoice())
+                    }
+                } else {
+                    currentModelPath = null
                     liteRtProvider?.close()
                     liteRtProvider = null
                 }
-                _uiState.update { it.copy(modelState = state, providerLabel = if (state is ModelState.Ready) "LiteRT-LM" else "deterministic local") }
+                _uiState.update { it.copy(modelState = state, providerLabel = if (state is ModelState.Ready) "LiteRT-LM (${currentBackend.name})" else "Gemma not ready") }
+            }
+        }
+        viewModelScope.launch {
+            conversationStore.backendPref.collect { pref ->
+                currentBackend = pref
+                if (pref != _uiState.value.backendPref) {
+                    val modelPath = currentModelPath
+                    liteRtProvider?.close()
+                    liteRtProvider = if (modelPath != null) LiteRtLmProvider(appContext, modelPath, pref.toChoice()) else null
+                }
+                _uiState.update { state ->
+                    state.copy(
+                        backendPref = pref,
+                        providerLabel = if (state.modelState is ModelState.Ready) "LiteRT-LM (${pref.name})" else state.providerLabel,
+                    )
+                }
             }
         }
         bootstrap()
@@ -101,10 +132,10 @@ class MedLensViewModel(
     fun sendMessage(message: String) {
         if (message.isBlank() || _uiState.value.busy) return
         val repo = repository ?: return
+        val provider = liteRtProvider ?: return
         val orchestrator = AgentOrchestrator(
-            store = repo,
             dispatcher = ToolDispatcher(repo),
-            provider = liteRtProvider,
+            provider = provider,
         )
         val current = activeConversation() ?: return
         val assistantId = java.util.UUID.randomUUID().toString()
@@ -122,7 +153,7 @@ class MedLensViewModel(
             )
 
             runCatching {
-                orchestrator.runTurn(session, message)
+                orchestrator.runTurn(session, message, audiencePrompt = _uiState.value.audienceStyle.prompt())
             }.onSuccess { result ->
                 val active = activeConversation()
                 val updatedConversation = active?.copy(
@@ -134,16 +165,10 @@ class MedLensViewModel(
                 )
                 if (updatedConversation != null) saveConversation(updatedConversation)
                 _uiState.update { it.copy(trace = result.trace, busy = false) }
-            }.onFailure { error ->
+            }.onFailure {
                 val active = activeConversation()
                 val updatedConversation = active?.copy(
-                    messages = active.messages.map {
-                        if (it.id == assistantId) {
-                            it.copy(content = error.message ?: "Request failed", pending = false)
-                        } else {
-                            it
-                        }
-                    },
+                    messages = active.messages.filterNot { it.id == assistantId },
                     updatedAt = System.currentTimeMillis(),
                 )
                 if (updatedConversation != null) saveConversation(updatedConversation)
@@ -179,6 +204,16 @@ class MedLensViewModel(
         modelManager.enqueueDownload()
     }
 
+    fun setBackendPref(pref: LiteRtBackendPref) {
+        viewModelScope.launch {
+            conversationStore.saveBackendPref(pref)
+        }
+    }
+
+    fun setAudienceStyle(style: AudienceStyle) {
+        _uiState.update { it.copy(audienceStyle = style) }
+    }
+
     fun acknowledgeOcrScaffold() {
         val conversation = activeConversation() ?: return
         viewModelScope.launch {
@@ -208,6 +243,17 @@ class MedLensViewModel(
 
     private fun activeConversation(): PersistedConversation? =
         _uiState.value.conversations.firstOrNull { it.id == _uiState.value.activeConversationId }
+
+    private fun LiteRtBackendPref.toChoice(): LiteRtBackendChoice = when (this) {
+        LiteRtBackendPref.CPU -> LiteRtBackendChoice.CPU
+        LiteRtBackendPref.GPU -> LiteRtBackendChoice.GPU
+    }
+
+    private fun AudienceStyle.prompt(): String = when (this) {
+        AudienceStyle.Regular -> "The user is a regular patient. Explain clearly, but include the practical mechanism when it helps them understand the risk."
+        AudienceStyle.Clinician -> "The user is a doctor or clinician. Use concise clinical language, include mechanism, severity, evidence regions, and monitoring implications."
+        AudienceStyle.Simple -> "Use simple language for an older adult or non-technical patient. Keep sentences short, explain medical terms, and focus on what to do next."
+    }
 
     private suspend fun hydrateSession(conversation: PersistedConversation?) {
         session.transcript.clear()
