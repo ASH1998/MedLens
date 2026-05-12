@@ -1,11 +1,14 @@
 package com.medlens.android.litert
 
 import android.content.Context
+import android.util.Log
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.OpenApiTool
 import com.google.ai.edge.litertlm.tool
 import com.medlens.core.agent.model.AgentMessage
@@ -20,13 +23,18 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+
+enum class LiteRtBackendChoice { CPU, GPU }
 
 class LiteRtLmProvider(
     private val context: Context,
     private val modelPath: String,
+    private val backendChoice: LiteRtBackendChoice = LiteRtBackendChoice.CPU,
 ) : NativeToolProvider {
     override val name: String = "litert-lm"
 
@@ -54,7 +62,7 @@ class LiteRtLmProvider(
                     ToolCall(
                         id = "litert-$index",
                         name = call.name,
-                        args = call.arguments.mapValues { (_, value) -> value?.toString().orEmpty() },
+                        args = call.arguments.mapValues { (_, value) -> encodeToolArgument(value) },
                     )
                 }
                 ToolModelResponse(
@@ -71,21 +79,71 @@ class LiteRtLmProvider(
     }
 
     private fun createEngine(): Engine {
-        val config = EngineConfig(
-            modelPath = modelPath,
-            backend = Backend.GPU(),
-            cacheDir = context.cacheDir.path,
-        )
-        return Engine(config).also { it.initialize() }
+        enableSpeculativeDecoding()
+        val backend = when (backendChoice) {
+            LiteRtBackendChoice.GPU -> Backend.GPU()
+            LiteRtBackendChoice.CPU -> Backend.CPU()
+        }
+        return runCatching {
+            val config = EngineConfig(
+                modelPath = modelPath,
+                backend = backend,
+                cacheDir = context.cacheDir.path,
+            )
+            Engine(config).also { it.initialize() }
+        }.getOrElse { error ->
+            if (backendChoice != LiteRtBackendChoice.GPU) throw error
+            Log.w(TAG, "GPU LiteRT backend failed; retrying this model session on CPU.", error)
+            val cpuConfig = EngineConfig(
+                modelPath = modelPath,
+                backend = Backend.CPU(),
+                cacheDir = context.cacheDir.path,
+            )
+            Engine(cpuConfig).also { it.initialize() }
+        }
     }
 
     private fun renderPrompt(messages: List<AgentMessage>): String = buildString {
-        messages.takeLast(14).forEach { message ->
+        messages.takeLast(6).forEach { message ->
             append(message.role.uppercase())
-            append(": ")
-            append(message.content)
+            when (message.role) {
+                "assistant" -> {
+                    append(": ")
+                    append(compactMessageContent(message))
+                    if (message.tool_calls.isNotEmpty()) {
+                        append("\nTOOL_CALLS:")
+                        message.tool_calls.forEach { call ->
+                            append("\n- ")
+                            append(call.name)
+                            append("(")
+                            append(call.args.entries.joinToString(", ") { "${it.key}=${it.value}" })
+                            append(")")
+                        }
+                    }
+                }
+                "tool" -> {
+                    append(" ")
+                    append(message.name ?: "tool")
+                    message.tool_call_id?.let {
+                        append(" [")
+                        append(it)
+                        append("]")
+                    }
+                    append(": ")
+                    append(compactMessageContent(message, TOOL_MESSAGE_CHAR_LIMIT))
+                }
+                else -> {
+                    append(": ")
+                    append(compactMessageContent(message))
+                }
+            }
             append("\n")
         }
+    }.takeLast(PROMPT_CHAR_BUDGET)
+
+    private fun compactMessageContent(message: AgentMessage, limit: Int = MESSAGE_CHAR_LIMIT): String {
+        val content = message.content.trim()
+        return if (content.length <= limit) content else content.take(limit) + "\n[truncated]"
     }
 
     private fun parseArgs(raw: String): Map<String, String> {
@@ -99,20 +157,44 @@ class LiteRtLmProvider(
             }
         }.getOrElse { emptyMap() }
     }
+
+    private fun encodeToolArgument(value: Any?): String = when (value) {
+        null -> ""
+        is String -> value
+        is Number, is Boolean -> value.toString()
+        is List<*> -> buildJsonArray {
+            value.forEach { add(JsonPrimitive(it?.toString().orEmpty())) }
+        }.toString()
+        is Array<*> -> buildJsonArray {
+            value.forEach { add(JsonPrimitive(it?.toString().orEmpty())) }
+        }.toString()
+        is Map<*, *> -> buildJsonObject {
+            value.forEach { (key, item) ->
+                put(key.toString(), Json.encodeToJsonElement(item?.toString()))
+            }
+        }.toString()
+        else -> value.toString()
+    }
+}
+
+private const val TAG = "LiteRtLmProvider"
+private const val PROMPT_CHAR_BUDGET = 9000
+private const val MESSAGE_CHAR_LIMIT = 900
+private const val TOOL_MESSAGE_CHAR_LIMIT = 3200
+
+@OptIn(ExperimentalApi::class)
+private fun enableSpeculativeDecoding() {
+    ExperimentalFlags.enableSpeculativeDecoding = true
 }
 
 private class MedLensOpenApiTool(
     private val schema: ToolSchema,
 ) : OpenApiTool {
     override fun getToolDescriptionJsonString(): String {
-        val params = buildJsonObject {
-            put("type", JsonPrimitive("object"))
-            put("properties", JsonObject(emptyMap()))
-        }
         return buildJsonObject {
             put("name", JsonPrimitive(schema.name))
             put("description", JsonPrimitive(schema.description))
-            put("parameters", params)
+            put("parameters", Json.parseToJsonElement(schema.inputSchemaJson))
         }.toString()
     }
 
