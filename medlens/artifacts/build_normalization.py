@@ -92,6 +92,13 @@ def import_india_common_medicines(conn: sqlite3.Connection, csv_path: Path) -> i
 
             generic_aliases = _generic_aliases(generic_name)
             brand_aliases = _brand_aliases(_row_field(row, "common_brand_examples_india"))
+            brand_aliases = (
+                *brand_aliases,
+                *_brand_strength_aliases(
+                    brand_aliases,
+                    _row_field(row, "composition_or_strength_pattern"),
+                ),
+            )
             drug_id = _resolve_existing_drug_id(conn, (*generic_aliases, *brand_aliases))
             if drug_id is None:
                 canonical_name = normalize_lookup_text(generic_name)
@@ -249,6 +256,31 @@ def _brand_aliases(value: str) -> tuple[str, ...]:
         part = re.sub(r"\s+as applicable$", "", part, flags=re.IGNORECASE).strip()
         if normalize_lookup_text(part):
             aliases.append(part)
+    return tuple(dict.fromkeys(aliases))
+
+
+def _brand_strength_aliases(brand_aliases: tuple[str, ...], composition: str) -> tuple[str, ...]:
+    strengths = tuple(
+        dict.fromkeys(
+            match.group(1).lstrip("0") or "0"
+            for match in re.finditer(
+                r"\b(\d+(?:\.\d+)?)\s*(?:mg|mcg|g|ml|iu)\b",
+                composition,
+                flags=re.IGNORECASE,
+            )
+        )
+    )
+    if not strengths:
+        return ()
+
+    aliases: list[str] = []
+    for brand in brand_aliases:
+        normalized_brand = normalize_lookup_text(brand)
+        if not normalized_brand:
+            continue
+        for strength in strengths[:4]:
+            aliases.append(f"{brand} {strength}")
+            aliases.append(f"{brand}{strength}")
     return tuple(dict.fromkeys(aliases))
 
 

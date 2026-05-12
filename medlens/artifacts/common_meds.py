@@ -27,7 +27,7 @@ class DrugSeed:
 
 
 CURATED_COMMON_MED_SEEDS: tuple[DrugSeed, ...] = (
-    DrugSeed("acetaminophen", "pain_fever", ("paracetamol", "tylenol", "calpol", "dolo 650")),
+    DrugSeed("acetaminophen", "pain_fever", ("paracetamol", "tylenol", "calpol", "dolo", "dolo 650", "dolo650")),
     DrugSeed("ibuprofen", "pain_fever", ("advil", "motrin", "brufen")),
     DrugSeed("aspirin", "pain_fever", ("acetylsalicylic acid", "ecosprin", "disprin")),
     DrugSeed("naproxen", "pain_fever", ("aleve", "naprosyn")),

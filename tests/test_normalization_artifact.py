@@ -33,10 +33,20 @@ class NormalizationArtifactTest(unittest.TestCase):
                     """,
                     ("paracetamol",),
                 ).fetchone()
+                dolo650 = conn.execute(
+                    """
+                    SELECT d.canonical_name
+                    FROM drug_alias a
+                    JOIN drug d ON d.id = a.drug_id
+                    WHERE a.normalized_alias = ?
+                    """,
+                    ("dolo650",),
+                ).fetchone()
 
             self.assertGreaterEqual(drug_count, 750)
             self.assertGreaterEqual(alias_count, 1000)
             self.assertEqual(row, ("acetaminophen",))
+            self.assertEqual(dolo650, ("acetaminophen",))
 
     def test_build_artifact_imports_india_common_medicines_for_alias_search(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -65,6 +75,14 @@ class NormalizationArtifactTest(unittest.TestCase):
                     WHERE a.normalized_alias = 'acetaminophen'
                     """
                 ).fetchone()
+                common_brand_dose = conn.execute(
+                    """
+                    SELECT d.canonical_name
+                    FROM drug_alias a
+                    JOIN drug d ON d.id = a.drug_id
+                    WHERE a.normalized_alias = 'dolo500'
+                    """
+                ).fetchone()
                 component_alias = conn.execute(
                     "SELECT COUNT(*) FROM drug_alias WHERE normalized_alias = 'combiflam'"
                 ).fetchone()[0]
@@ -72,6 +90,7 @@ class NormalizationArtifactTest(unittest.TestCase):
             self.assertEqual(common_count, 2)
             self.assertEqual(dolo, ("acetaminophen",))
             self.assertEqual(synonym, ("acetaminophen",))
+            self.assertEqual(common_brand_dose, ("acetaminophen",))
             self.assertEqual(component_alias, 0)
 
     def _write_common_medicines_fixture(self, path: Path) -> None:
