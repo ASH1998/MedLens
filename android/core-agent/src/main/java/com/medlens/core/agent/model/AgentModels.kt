@@ -21,6 +21,9 @@ data class ToolModelResponse(
 data class AgentMessage(
     val role: String,
     val content: String,
+    val tool_calls: List<ToolCall> = emptyList(),
+    val tool_call_id: String? = null,
+    val name: String? = null,
 )
 
 interface NativeToolProvider {
@@ -57,6 +60,7 @@ data class ChatSession(
 data class ToolSchema(
     val name: String,
     val description: String,
+    val inputSchemaJson: String = """{"type":"object","properties":{}}""",
 )
 
 @Serializable
@@ -66,5 +70,4 @@ data class AgentTurnResult(
     val report: MedicationSafetyReport?,
     val usedTools: List<String>,
     val providerName: String,
-    val fallbackUsed: Boolean,
 )
