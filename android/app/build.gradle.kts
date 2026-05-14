@@ -28,6 +28,7 @@ fun gradleStringLiteral(value: String): String = "\"${value.replace("\\", "\\\\"
 val syncMedlensAssets by tasks.registering(Copy::class) {
     from("../../data/artifacts/normalization.sqlite")
     from("../../data/artifacts/evidence.mobile.sqlite")
+    from("../../data/raw/DDI/india_common_brand_ingredient_map.csv")
     into(medlensAssetDir)
 }
 
@@ -39,8 +40,8 @@ android {
         applicationId = "com.medlens.android"
         minSdk = 31
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.1.4"
+        versionCode = 11
+        versionName = "0.1.11"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
