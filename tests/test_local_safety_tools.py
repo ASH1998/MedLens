@@ -73,11 +73,46 @@ class LocalSafetyToolsTest(unittest.TestCase):
         self.assertEqual(by_input["Advil"]["highest_severity"], "Major")
         self.assertTrue(by_input["Mystery Pill"]["unresolved"])
 
+    def test_common_painkiller_combo_gets_practical_calibration(self) -> None:
+        normalized = self.store.normalize_medication_names(["Aldigesic-SP Forte", "Crocin"])
+        self.assertEqual(
+            [item.canonical_name for item in normalized],
+            ["aceclofenac", "acetaminophen", "serratiopeptidase", "acetaminophen"],
+        )
+        self.assertEqual(
+            [item.canonical_name for item in self.store.normalize_medication_names(["aldjgesic-sp"])],
+            ["aceclofenac", "acetaminophen", "serratiopeptidase"],
+        )
+        self.assertEqual(
+            [item.canonical_name for item in self.store.normalize_medication_names(["it is aldigesic-sp"])],
+            ["aceclofenac", "acetaminophen", "serratiopeptidase"],
+        )
+
+        report = self.store.build_structured_report(["Aldigesic-SP Forte", "Crocin"])
+        self.assertEqual(report.overall_severity, "Major")
+        duplicate = report.duplicate_ingredient_warnings[0]
+        self.assertEqual(duplicate.ingredient, "acetaminophen")
+        self.assertEqual(duplicate.practical_risk_tier, "duplicate_dose_risk")
+
+        guidance_by_pair = {
+            (finding.drug_a, finding.drug_b): finding.practical_guidance
+            for finding in report.findings
+        }
+        guidance = guidance_by_pair[("aceclofenac", "acetaminophen")]
+        self.assertIsNotNone(guidance)
+        self.assertEqual(guidance.practical_risk_tier, "usually_ok_with_limits")
+
+    def test_high_risk_nsaid_blood_thinner_stays_high_concern(self) -> None:
+        interaction = self.store.lookup_known_interaction("Advil", "Warfarin")
+        self.assertEqual(interaction.severity, "Major")
+        self.assertIsNotNone(interaction.practical_guidance)
+        self.assertEqual(interaction.practical_guidance.practical_risk_tier, "avoid_or_check_first")
+
     def test_evidence_metadata_tools(self) -> None:
         sources = self.store.list_evidence_sources()
         issues = self.store.list_import_issues(query="unknown")
         self.assertEqual(sources[0]["source_file"], "usa_prioritized_ddi_ade_signals.csv")
-        self.assertEqual(sources[0]["rows_seen"], 6)
+        self.assertEqual(sources[0]["rows_seen"], 7)
         self.assertEqual(issues[0]["reason"], "drug1_unresolved")
 
     def test_compact_evidence_artifact_preserves_raw_evidence(self) -> None:

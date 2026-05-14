@@ -14,6 +14,7 @@ from medlens.artifacts.schema import NORMALIZATION_SCHEMA
 NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 COMMON_MEDICINES_INDIA_CSV = Path("data/raw/DDI/common_medicines_india_dataset_5000.csv")
 INDIA_BRAND_INGREDIENT_MAP_CSV = Path("data/raw/DDI/india_common_brand_ingredient_map.csv")
+PRACTICAL_PAIR_GUIDANCE_CSV = Path("data/raw/DDI/practical_pair_guidance.csv")
 SALT_SUFFIXES = (
     "hydrochloride",
     "sulfate",
@@ -192,18 +193,19 @@ def import_brand_ingredient_map(conn: sqlite3.Connection, csv_path: Path) -> int
             region = _row_field(row, "region") or "india"
             source_basis = _row_field(row, "source_basis")
             source_urls = _row_field(row, "source_urls")
+            ingredient_drug_ids: list[int] = []
 
-            for index, ingredient in enumerate(ingredients):
+            for ingredient in ingredients:
                 drug_id = _resolve_existing_drug_id(conn, (ingredient,))
                 if drug_id is None:
-                    drug_id = _upsert_drug(
-                        conn,
-                        canonical_name=normalize_lookup_text(ingredient),
-                        category="combination_product_ingredient",
-                        region_scope=region,
-                    )
-                    _insert_alias(conn, drug_id, ingredient, "canonical", region)
+                    ingredient_drug_ids = []
+                    break
+                ingredient_drug_ids.append(drug_id)
 
+            if not ingredient_drug_ids:
+                continue
+
+            for index, drug_id in enumerate(ingredient_drug_ids):
                 conn.execute(
                     """
                     INSERT INTO medicine_ingredient_map (
@@ -230,6 +232,55 @@ def import_brand_ingredient_map(conn: sqlite3.Connection, csv_path: Path) -> int
                         source_urls,
                     ),
                 )
+            imported += 1
+    return imported
+
+
+def import_practical_pair_guidance(conn: sqlite3.Connection, csv_path: Path) -> int:
+    """Import deterministic patient-facing interpretation rules for common pairs/classes."""
+    if not csv_path.exists():
+        return 0
+
+    imported = 0
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            rule_id = _row_field(row, "rule_id")
+            left_key = normalize_lookup_text(_row_field(row, "left_key"))
+            right_key = normalize_lookup_text(_row_field(row, "right_key"))
+            practical_summary = _row_field(row, "practical_summary")
+            if not rule_id or not left_key or not right_key or not practical_summary:
+                continue
+            ordered = tuple(sorted((left_key, right_key)))
+            conn.execute(
+                """
+                INSERT INTO practical_pair_guidance (
+                    rule_id, left_key, right_key, match_type, practical_risk_tier,
+                    practical_summary, dose_context_needed, risk_factor_questions, source_urls
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(rule_id) DO UPDATE SET
+                    left_key = excluded.left_key,
+                    right_key = excluded.right_key,
+                    match_type = excluded.match_type,
+                    practical_risk_tier = excluded.practical_risk_tier,
+                    practical_summary = excluded.practical_summary,
+                    dose_context_needed = excluded.dose_context_needed,
+                    risk_factor_questions = excluded.risk_factor_questions,
+                    source_urls = excluded.source_urls
+                """,
+                (
+                    rule_id,
+                    ordered[0],
+                    ordered[1],
+                    _row_field(row, "match_type") or "class",
+                    _row_field(row, "practical_risk_tier") or "conditional",
+                    practical_summary,
+                    _row_field(row, "dose_context_needed"),
+                    _row_field(row, "risk_factor_questions"),
+                    _row_field(row, "source_urls"),
+                ),
+            )
             imported += 1
     return imported
 
@@ -363,8 +414,10 @@ def build_normalization_db(
     output: Path,
     common_medicines_csv: Path | None = COMMON_MEDICINES_INDIA_CSV,
     brand_ingredient_map_csv: Path | None = INDIA_BRAND_INGREDIENT_MAP_CSV,
+    practical_pair_guidance_csv: Path | None = PRACTICAL_PAIR_GUIDANCE_CSV,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
+    output.unlink(missing_ok=True)
     with sqlite3.connect(output) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         create_schema(conn)
@@ -374,6 +427,8 @@ def build_normalization_db(
             import_india_common_medicines(conn, common_medicines_csv)
         if brand_ingredient_map_csv is not None:
             import_brand_ingredient_map(conn, brand_ingredient_map_csv)
+        if practical_pair_guidance_csv is not None:
+            import_practical_pair_guidance(conn, practical_pair_guidance_csv)
         conn.commit()
         conn.execute("PRAGMA optimize")
 
@@ -405,12 +460,23 @@ def parse_args() -> argparse.Namespace:
         default=INDIA_BRAND_INGREDIENT_MAP_CSV,
         help="Optional curated brand-to-active-ingredient CSV for combination products.",
     )
+    parser.add_argument(
+        "--practical-pair-guidance-csv",
+        type=Path,
+        default=PRACTICAL_PAIR_GUIDANCE_CSV,
+        help="Optional curated class/pair guidance CSV for patient-facing interpretation.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    build_normalization_db(args.output, args.common_medicines_csv, args.brand_ingredient_map_csv)
+    build_normalization_db(
+        args.output,
+        args.common_medicines_csv,
+        args.brand_ingredient_map_csv,
+        args.practical_pair_guidance_csv,
+    )
     drug_count, alias_count = artifact_stats(args.output)
     print(f"Built {args.output}")
     print(f"Drugs: {drug_count}")
