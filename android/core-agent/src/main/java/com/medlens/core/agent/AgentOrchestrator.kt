@@ -130,6 +130,11 @@ class AgentOrchestrator(
                         }
                     },
                 )
+                put(
+                    "duplicate_ingredient_warnings",
+                    root["duplicate_ingredient_warnings"]?.jsonArrayOrEmpty()?.take(4)?.let { JsonArray(it) }
+                        ?: JsonArray(emptyList()),
+                )
             },
         )
     }.getOrElse { content }
@@ -193,6 +198,19 @@ class AgentOrchestrator(
         copyLimitedArray(obj, "mechanisms", 3)
         copyLimitedArray(obj, "risk_flags", 4)
         copyLimitedArray(obj, "evidence_bases", 4)
+        obj["practical_guidance"]?.jsonObjectOrNull()?.let { guidance ->
+            put(
+                "practical_guidance",
+                buildJsonObject {
+                    copy(guidance, "rule_id")
+                    copy(guidance, "practical_risk_tier")
+                    copy(guidance, "practical_summary")
+                    copy(guidance, "dose_context_needed")
+                    copy(guidance, "risk_factor_questions")
+                    copyLimitedArray(guidance, "source_urls", 4)
+                },
+            )
+        }
     }
 
     private fun compactEffects(element: JsonElement?, limit: Int): JsonArray = buildJsonArray {
