@@ -127,6 +127,29 @@ class MedicationSafetyStore:
         with sqlite3.connect(self.normalization_db) as conn:
             for name in names:
                 normalized_input = normalize_lookup_text(name)
+                ingredient_rows = conn.execute(
+                    """
+                    SELECT d.id, d.canonical_name, m.brand_name
+                    FROM medicine_ingredient_map m
+                    JOIN drug d ON d.id = m.ingredient_drug_id
+                    WHERE m.normalized_brand_name = ?
+                    ORDER BY m.ingredient_order, d.canonical_name
+                    """,
+                    (normalized_input,),
+                ).fetchall()
+                if ingredient_rows:
+                    for drug_id, canonical_name, matched_alias in ingredient_rows:
+                        results.append(
+                            NormalizedMedication(
+                                input_name=name,
+                                normalized_input=normalized_input,
+                                canonical_name=str(canonical_name),
+                                drug_id=int(drug_id),
+                                matched_alias=str(matched_alias),
+                                resolved=True,
+                            )
+                        )
+                    continue
                 row = conn.execute(
                     """
                     SELECT d.id, d.canonical_name, a.alias

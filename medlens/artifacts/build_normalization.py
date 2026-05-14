@@ -13,6 +13,7 @@ from medlens.artifacts.schema import NORMALIZATION_SCHEMA
 
 NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 COMMON_MEDICINES_INDIA_CSV = Path("data/raw/DDI/common_medicines_india_dataset_5000.csv")
+INDIA_BRAND_INGREDIENT_MAP_CSV = Path("data/raw/DDI/india_common_brand_ingredient_map.csv")
 SALT_SUFFIXES = (
     "hydrochloride",
     "sulfate",
@@ -168,6 +169,71 @@ def import_india_common_medicines(conn: sqlite3.Connection, csv_path: Path) -> i
     return imported
 
 
+def import_brand_ingredient_map(conn: sqlite3.Connection, csv_path: Path) -> int:
+    """Import curated brand-to-active-ingredient mappings for combination products."""
+    if not csv_path.exists():
+        return 0
+
+    imported = 0
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            brand_name = _row_field(row, "brand_name")
+            ingredients = tuple(
+                item.strip()
+                for item in _row_field(row, "active_ingredients").split("|")
+                if normalize_lookup_text(item)
+            )
+            if not brand_name or not ingredients:
+                continue
+
+            strengths = tuple(item.strip() for item in _row_field(row, "strengths").split("|"))
+            normalized_brand = normalize_lookup_text(brand_name)
+            region = _row_field(row, "region") or "india"
+            source_basis = _row_field(row, "source_basis")
+            source_urls = _row_field(row, "source_urls")
+
+            for index, ingredient in enumerate(ingredients):
+                drug_id = _resolve_existing_drug_id(conn, (ingredient,))
+                if drug_id is None:
+                    drug_id = _upsert_drug(
+                        conn,
+                        canonical_name=normalize_lookup_text(ingredient),
+                        category="combination_product_ingredient",
+                        region_scope=region,
+                    )
+                    _insert_alias(conn, drug_id, ingredient, "canonical", region)
+
+                conn.execute(
+                    """
+                    INSERT INTO medicine_ingredient_map (
+                        brand_name, normalized_brand_name, ingredient_drug_id,
+                        ingredient_order, strength, region, source_basis, source_urls
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(normalized_brand_name, ingredient_drug_id) DO UPDATE SET
+                        brand_name = excluded.brand_name,
+                        ingredient_order = excluded.ingredient_order,
+                        strength = excluded.strength,
+                        region = excluded.region,
+                        source_basis = excluded.source_basis,
+                        source_urls = excluded.source_urls
+                    """,
+                    (
+                        brand_name,
+                        normalized_brand,
+                        drug_id,
+                        index,
+                        strengths[index] if index < len(strengths) else "",
+                        region,
+                        source_basis,
+                        source_urls,
+                    ),
+                )
+            imported += 1
+    return imported
+
+
 def _upsert_drug(conn: sqlite3.Connection, canonical_name: str, category: str, region_scope: str) -> int:
     cur = conn.execute(
         """
@@ -293,7 +359,11 @@ def _row_field(row: dict[str, str], column: str) -> str:
     return (row.get(column) or "").strip()
 
 
-def build_normalization_db(output: Path, common_medicines_csv: Path | None = COMMON_MEDICINES_INDIA_CSV) -> None:
+def build_normalization_db(
+    output: Path,
+    common_medicines_csv: Path | None = COMMON_MEDICINES_INDIA_CSV,
+    brand_ingredient_map_csv: Path | None = INDIA_BRAND_INGREDIENT_MAP_CSV,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(output) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
@@ -302,6 +372,8 @@ def build_normalization_db(output: Path, common_medicines_csv: Path | None = COM
             insert_seed(conn, seed)
         if common_medicines_csv is not None:
             import_india_common_medicines(conn, common_medicines_csv)
+        if brand_ingredient_map_csv is not None:
+            import_brand_ingredient_map(conn, brand_ingredient_map_csv)
         conn.commit()
         conn.execute("PRAGMA optimize")
 
@@ -327,12 +399,18 @@ def parse_args() -> argparse.Namespace:
         default=COMMON_MEDICINES_INDIA_CSV,
         help="Optional India common medicines CSV to import for OCR/user-name recovery.",
     )
+    parser.add_argument(
+        "--brand-ingredient-map-csv",
+        type=Path,
+        default=INDIA_BRAND_INGREDIENT_MAP_CSV,
+        help="Optional curated brand-to-active-ingredient CSV for combination products.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    build_normalization_db(args.output, args.common_medicines_csv)
+    build_normalization_db(args.output, args.common_medicines_csv, args.brand_ingredient_map_csv)
     drug_count, alias_count = artifact_stats(args.output)
     print(f"Built {args.output}")
     print(f"Drugs: {drug_count}")
