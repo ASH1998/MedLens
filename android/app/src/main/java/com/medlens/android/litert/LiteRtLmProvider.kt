@@ -3,6 +3,7 @@ package com.medlens.android.litert
 import android.content.Context
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
@@ -73,6 +74,30 @@ class LiteRtLmProvider(
         }
     }
 
+    suspend fun extractMedicineCandidatesFromImage(
+        imagePath: String,
+        userText: String,
+    ): String = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            val activeEngine = engine ?: createEngine().also { engine = it }
+            val conversation = activeEngine.createConversation(
+                ConversationConfig(
+                    systemInstruction = Contents.of(IMAGE_EXTRACTION_SYSTEM_PROMPT),
+                    automaticToolCalling = false,
+                ),
+            )
+            conversation.use {
+                val response = it.sendMessage(
+                    Contents.of(
+                        Content.ImageFile(imagePath),
+                        Content.Text(imageExtractionUserPrompt(userText)),
+                    ),
+                )
+                response.toString().trim()
+            }
+        }
+    }
+
     fun close() {
         engine?.close()
         engine = null
@@ -88,6 +113,8 @@ class LiteRtLmProvider(
             val config = EngineConfig(
                 modelPath = modelPath,
                 backend = backend,
+                visionBackend = backend,
+                maxNumImages = 1,
                 cacheDir = context.cacheDir.path,
             )
             Engine(config).also { it.initialize() }
@@ -97,6 +124,8 @@ class LiteRtLmProvider(
             val cpuConfig = EngineConfig(
                 modelPath = modelPath,
                 backend = Backend.CPU(),
+                visionBackend = Backend.CPU(),
+                maxNumImages = 1,
                 cacheDir = context.cacheDir.path,
             )
             Engine(cpuConfig).also { it.initialize() }
@@ -178,9 +207,26 @@ class LiteRtLmProvider(
 }
 
 private const val TAG = "LiteRtLmProvider"
+private const val IMAGE_EXTRACTION_SYSTEM_PROMPT = """
+You extract medication names from images for MedLens.
+
+Return only visible candidate medicine names, active ingredients, strengths, and dosage forms.
+Do not give medication safety advice.
+Do not infer interactions, severity, adverse effects, mechanisms, or sources.
+If text is unclear, say which parts are unreadable and ask for a clearer photo.
+Keep the answer short and structured as plain text.
+"""
 private const val PROMPT_CHAR_BUDGET = 9000
 private const val MESSAGE_CHAR_LIMIT = 900
 private const val TOOL_MESSAGE_CHAR_LIMIT = 3200
+
+private fun imageExtractionUserPrompt(userText: String): String = buildString {
+    append("Read this medicine image. Extract visible medicine candidates for a safety check.")
+    if (userText.isNotBlank()) {
+        append("\nUser context/question: ")
+        append(userText.trim())
+    }
+}
 
 @OptIn(ExperimentalApi::class)
 private fun enableSpeculativeDecoding() {

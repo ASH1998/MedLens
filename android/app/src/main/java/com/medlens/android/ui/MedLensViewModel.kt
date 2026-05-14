@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 
 sealed interface SetupStage {
     data object Checking : SetupStage
@@ -177,6 +178,76 @@ class MedLensViewModel(
         }
     }
 
+    fun sendImageMessage(imagePath: String, userText: String) {
+        sendImageMessage(listOf(imagePath), userText)
+    }
+
+    fun sendImageMessage(imagePaths: List<String>, userText: String) {
+        if (_uiState.value.busy) return
+        val safeImagePaths = imagePaths.take(MAX_IMAGE_ATTACHMENTS)
+        if (safeImagePaths.isEmpty()) return
+        val repo = repository ?: return
+        val provider = liteRtProvider ?: return
+        val orchestrator = AgentOrchestrator(
+            dispatcher = ToolDispatcher(repo),
+            provider = provider,
+        )
+        val current = activeConversation() ?: return
+        val displayText = userText.trim()
+        val titleText = displayText.ifBlank { "Image attached" }
+        val assistantId = java.util.UUID.randomUUID().toString()
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(busy = true) }
+            val userMessage = UiMessage(
+                id = java.util.UUID.randomUUID().toString(),
+                role = "user",
+                content = displayText,
+                imagePath = safeImagePaths.firstOrNull(),
+                imagePaths = safeImagePaths,
+            )
+            val pendingAssistant = UiMessage(id = assistantId, role = "assistant", content = "", pending = true)
+            saveConversation(
+                current.copy(
+                    title = if (current.messages.isEmpty()) ConversationStore.titleFromMessage(titleText) else current.title,
+                    messages = current.messages + listOf(userMessage, pendingAssistant),
+                    updatedAt = System.currentTimeMillis(),
+                ),
+            )
+
+            runCatching {
+                val extractedParts = safeImagePaths.mapIndexed { index, imagePath ->
+                    val text = provider.extractMedicineCandidatesFromImage(imagePath, userText)
+                    "Image ${index + 1}:\n${text.trim()}"
+                }.filter { it.isNotBlank() }
+                val extracted = extractedParts.joinToString("\n\n")
+                if (extracted.isBlank()) error("No visible medicine text was extracted from the attached image.")
+                val candidates = medicationCandidatesFromExtraction(extracted)
+                val agentMessage = imageAgentMessage(extracted, candidates, userText)
+                orchestrator.runTurn(session, agentMessage, audiencePrompt = _uiState.value.audienceStyle.prompt())
+            }.onSuccess { result ->
+                val active = activeConversation()
+                val updatedConversation = active?.copy(
+                    messages = active.messages.map {
+                        if (it.id == assistantId) it.copy(content = result.finalText, pending = false) else it
+                    },
+                    medications = session.medicationInputs(),
+                    updatedAt = System.currentTimeMillis(),
+                )
+                if (updatedConversation != null) saveConversation(updatedConversation)
+                _uiState.update { it.copy(trace = result.trace, busy = false) }
+            }.onFailure {
+                val active = activeConversation()
+                val updatedConversation = active?.copy(
+                    messages = active.messages.filterNot { it.id == assistantId },
+                    updatedAt = System.currentTimeMillis(),
+                )
+                if (updatedConversation != null) saveConversation(updatedConversation)
+                _uiState.update { it.copy(busy = false) }
+            }
+        }
+    }
+
     fun createConversation() {
         viewModelScope.launch {
             val next = ConversationStore.newConversation()
@@ -193,6 +264,10 @@ class MedLensViewModel(
 
     fun deleteConversation(id: String) {
         viewModelScope.launch {
+            activeConversation(id)?.messages
+                ?.flatMap { message -> message.imagePaths.ifEmpty { listOfNotNull(message.imagePath) } }
+                ?.distinct()
+                ?.forEach { runCatching { File(it).delete() } }
             val remaining = _uiState.value.conversations.filterNot { it.id == id }
             val next = if (remaining.isEmpty()) listOf(ConversationStore.newConversation()) else remaining
             val nextActive = if (_uiState.value.activeConversationId == id) next.first().id else _uiState.value.activeConversationId
@@ -214,22 +289,6 @@ class MedLensViewModel(
         _uiState.update { it.copy(audienceStyle = style) }
     }
 
-    fun acknowledgeOcrScaffold() {
-        val conversation = activeConversation() ?: return
-        viewModelScope.launch {
-            saveConversation(
-                conversation.copy(
-                    messages = conversation.messages + UiMessage(
-                        id = java.util.UUID.randomUUID().toString(),
-                        role = "assistant",
-                        content = "OCR manager is scaffolded in the Android app, but the camera capture flow still needs device-side wiring and validation.",
-                    ),
-                    updatedAt = System.currentTimeMillis(),
-                ),
-            )
-        }
-    }
-
     override fun onCleared() {
         liteRtProvider?.close()
         repository?.close()
@@ -244,6 +303,9 @@ class MedLensViewModel(
     private fun activeConversation(): PersistedConversation? =
         _uiState.value.conversations.firstOrNull { it.id == _uiState.value.activeConversationId }
 
+    private fun activeConversation(id: String): PersistedConversation? =
+        _uiState.value.conversations.firstOrNull { it.id == id }
+
     private fun LiteRtBackendPref.toChoice(): LiteRtBackendChoice = when (this) {
         LiteRtBackendPref.CPU -> LiteRtBackendChoice.CPU
         LiteRtBackendPref.GPU -> LiteRtBackendChoice.GPU
@@ -253,6 +315,76 @@ class MedLensViewModel(
         AudienceStyle.Regular -> "The user is a regular patient. Explain clearly, but include the practical mechanism when it helps them understand the risk."
         AudienceStyle.Clinician -> "The user is a doctor or clinician. Use concise clinical language, include mechanism, severity, evidence regions, and monitoring implications."
         AudienceStyle.Simple -> "Use simple language for an older adult or non-technical patient. Keep sentences short, explain medical terms, and focus on what to do next."
+    }
+
+    private fun imageAgentMessage(
+        extracted: String,
+        candidates: List<String>,
+        userText: String,
+    ): String = buildString {
+        append("The user attached medicine image(s). Visible medicine candidates:\n")
+        append(extracted.trim())
+        if (candidates.isNotEmpty()) {
+            append("\n\nSeparate medication candidates to check. Treat each bullet as one product/name and call build_structured_report with exactly these medication_names before answering:\n")
+            candidates.forEach { candidate ->
+                append("- ")
+                append(candidate)
+                append("\n")
+            }
+        }
+        append("\n\nUse only deterministic local evidence to answer. Do not mention internal tools, extraction steps, or databases to the user.")
+        if (userText.isBlank()) {
+            append("\nUser intent: identify the visible medicines and check relevant medication safety concerns among them.")
+        } else {
+            append("\nUser question/context: ")
+            append(userText.trim())
+        }
+    }
+
+    private fun medicationCandidatesFromExtraction(extracted: String): List<String> {
+        val rejectedTerms = listOf(
+            "unreadable",
+            "unclear",
+            "unable",
+            "cannot",
+            "could not",
+            "not visible",
+            "safety",
+            "interaction",
+            "question",
+            "context",
+        )
+        val candidates = linkedSetOf<String>()
+        extracted
+            .replace(Regex("(?i)\\bImage\\s+\\d+\\s*:"), "\n")
+            .split(Regex("[\\n;,]|\\s+and\\s+", RegexOption.IGNORE_CASE))
+            .map { raw ->
+                raw.trim()
+                    .replace(Regex("^[-*•\\d.)\\s]+"), "")
+                    .replace(Regex("(?i)^(medicine|medication|brand|name|candidate|visible text|product)\\s*:?\\s*"), "")
+                    .trim()
+            }
+            .filter { item ->
+                item.length in 3..80 &&
+                    rejectedTerms.none { item.contains(it, ignoreCase = true) } &&
+                    item.any { it.isLetter() }
+            }
+            .forEach { item ->
+                candidates += item
+                simplifiedCandidate(item)?.let { candidates += it }
+            }
+        return candidates.take(8)
+    }
+
+    private fun simplifiedCandidate(value: String): String? {
+        val simplified = value
+            .replace(Regex("(?i)\\b\\d+(?:\\.\\d+)?\\s*(?:mg|mcg|g|ml|iu)\\b"), " ")
+            .replace(Regex("(?i)\\b(tablets?|tabs?|capsules?|caps?|syrup|injection|cream|ointment|strip|bottle)\\b"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .trim('-', ':')
+            .trim()
+        return simplified.takeIf { it.length >= 3 && !it.equals(value, ignoreCase = true) }
     }
 
     private suspend fun hydrateSession(conversation: PersistedConversation?) {
@@ -269,3 +401,5 @@ class MedLensViewModel(
         }
     }
 }
+
+private const val MAX_IMAGE_ATTACHMENTS = 3

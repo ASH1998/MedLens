@@ -24,6 +24,8 @@ data class UiMessage(
     val role: String,
     val content: String,
     val pending: Boolean = false,
+    val imagePath: String? = null,
+    val imagePaths: List<String> = emptyList(),
 )
 
 @Serializable
