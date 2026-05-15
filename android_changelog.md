@@ -1,5 +1,24 @@
 # Android Changelog
 
+## v0.1.12-pre-release - 2026-05-15
+
+- Updated Android package metadata to `versionCode = 12` and
+  `versionName = "0.1.12-pre-release"`.
+- Fixed multi-turn medication checks so a complete current-turn pair such as
+  `amiodarone and fluorouracil` is checked as that pair while prior chat
+  context remains available for incomplete follow-ups.
+- Added deterministic answer verification so model text that says no flagged
+  interaction is replaced when the local structured report has a finding.
+- Improved attached-image prompts so multiple images are treated as one
+  combined medicine list without patient-facing image-processing preambles.
+- Improved patient-facing fallback wording to lead with the practical finding
+  instead of internal pair-count or local-reference phrasing.
+- Added Android core-agent regression tests for contradictory model answers,
+  current-turn pair precedence, incomplete follow-ups, and duplicate
+  active-ingredient warnings like Crocin plus DOLO 650.
+- Added a documented fresh debug APK rebuild command using repo-local Gradle
+  8.7, `--rerun-tasks`, and `--max-workers=2`.
+
 ## v0.1.11 - 2026-05-14
 
 - Added deterministic practical-risk calibration on top of reference DDI
