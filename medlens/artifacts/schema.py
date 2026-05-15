@@ -43,11 +43,39 @@ CREATE TABLE IF NOT EXISTS india_common_medicine (
     dataset_note TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS medicine_ingredient_map (
+    id INTEGER PRIMARY KEY,
+    brand_name TEXT NOT NULL,
+    normalized_brand_name TEXT NOT NULL,
+    ingredient_drug_id INTEGER NOT NULL REFERENCES drug(id) ON DELETE CASCADE,
+    ingredient_order INTEGER NOT NULL,
+    strength TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT 'india',
+    source_basis TEXT NOT NULL DEFAULT '',
+    source_urls TEXT NOT NULL DEFAULT '',
+    UNIQUE(normalized_brand_name, ingredient_drug_id)
+);
+
+CREATE TABLE IF NOT EXISTS practical_pair_guidance (
+    id INTEGER PRIMARY KEY,
+    rule_id TEXT NOT NULL UNIQUE,
+    left_key TEXT NOT NULL,
+    right_key TEXT NOT NULL,
+    match_type TEXT NOT NULL,
+    practical_risk_tier TEXT NOT NULL,
+    practical_summary TEXT NOT NULL,
+    dose_context_needed TEXT NOT NULL,
+    risk_factor_questions TEXT NOT NULL,
+    source_urls TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_drug_alias_drug_id ON drug_alias(drug_id);
 CREATE INDEX IF NOT EXISTS idx_drug_alias_normalized ON drug_alias(normalized_alias);
 CREATE INDEX IF NOT EXISTS idx_drug_category ON drug(category);
 CREATE INDEX IF NOT EXISTS idx_india_common_medicine_drug_id ON india_common_medicine(drug_id);
 CREATE INDEX IF NOT EXISTS idx_india_common_medicine_normalized ON india_common_medicine(normalized_generic_name);
+CREATE INDEX IF NOT EXISTS idx_medicine_ingredient_map_normalized ON medicine_ingredient_map(normalized_brand_name);
+CREATE INDEX IF NOT EXISTS idx_practical_pair_guidance_keys ON practical_pair_guidance(left_key, right_key);
 """
 
 EVIDENCE_SCHEMA = """

@@ -14,6 +14,9 @@ import java.util.UUID
 private val Context.dataStore by preferencesDataStore(name = "medlens_android")
 private val CONVERSATIONS_KEY = stringPreferencesKey("conversations")
 private val ACTIVE_ID_KEY = stringPreferencesKey("active_conversation_id")
+private val LITERT_BACKEND_KEY = stringPreferencesKey("litert_backend")
+
+enum class LiteRtBackendPref { CPU, GPU }
 
 @Serializable
 data class UiMessage(
@@ -21,6 +24,8 @@ data class UiMessage(
     val role: String,
     val content: String,
     val pending: Boolean = false,
+    val imagePath: String? = null,
+    val imagePaths: List<String> = emptyList(),
 )
 
 @Serializable
@@ -61,6 +66,19 @@ class ConversationStore(
         dataStore.edit { prefs ->
             prefs[CONVERSATIONS_KEY] = json.encodeToString(conversations.take(30))
             prefs[ACTIVE_ID_KEY] = activeId
+        }
+    }
+
+    val backendPref: Flow<LiteRtBackendPref> = dataStore.data.map { prefs ->
+        when (prefs[LITERT_BACKEND_KEY]) {
+            "GPU" -> LiteRtBackendPref.GPU
+            else -> LiteRtBackendPref.CPU
+        }
+    }
+
+    suspend fun saveBackendPref(pref: LiteRtBackendPref) {
+        dataStore.edit { prefs ->
+            prefs[LITERT_BACKEND_KEY] = pref.name
         }
     }
 

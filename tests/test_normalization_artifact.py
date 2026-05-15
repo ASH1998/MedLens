@@ -33,10 +33,20 @@ class NormalizationArtifactTest(unittest.TestCase):
                     """,
                     ("paracetamol",),
                 ).fetchone()
+                dolo650 = conn.execute(
+                    """
+                    SELECT d.canonical_name
+                    FROM drug_alias a
+                    JOIN drug d ON d.id = a.drug_id
+                    WHERE a.normalized_alias = ?
+                    """,
+                    ("dolo650",),
+                ).fetchone()
 
             self.assertGreaterEqual(drug_count, 750)
             self.assertGreaterEqual(alias_count, 1000)
             self.assertEqual(row, ("acetaminophen",))
+            self.assertEqual(dolo650, ("acetaminophen",))
 
     def test_build_artifact_imports_india_common_medicines_for_alias_search(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -65,6 +75,14 @@ class NormalizationArtifactTest(unittest.TestCase):
                     WHERE a.normalized_alias = 'acetaminophen'
                     """
                 ).fetchone()
+                common_brand_dose = conn.execute(
+                    """
+                    SELECT d.canonical_name
+                    FROM drug_alias a
+                    JOIN drug d ON d.id = a.drug_id
+                    WHERE a.normalized_alias = 'dolo500'
+                    """
+                ).fetchone()
                 component_alias = conn.execute(
                     "SELECT COUNT(*) FROM drug_alias WHERE normalized_alias = 'combiflam'"
                 ).fetchone()[0]
@@ -72,7 +90,33 @@ class NormalizationArtifactTest(unittest.TestCase):
             self.assertEqual(common_count, 2)
             self.assertEqual(dolo, ("acetaminophen",))
             self.assertEqual(synonym, ("acetaminophen",))
+            self.assertEqual(common_brand_dose, ("acetaminophen",))
             self.assertEqual(component_alias, 0)
+
+    def test_build_artifact_imports_brand_ingredient_map(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output = root / "normalization.sqlite"
+            brand_map = root / "india_common_brand_ingredient_map.csv"
+            self._write_brand_ingredient_fixture(brand_map)
+
+            build_normalization_db(output, common_medicines_csv=None, brand_ingredient_map_csv=brand_map)
+
+            with sqlite3.connect(output) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT d.canonical_name
+                    FROM medicine_ingredient_map m
+                    JOIN drug d ON d.id = m.ingredient_drug_id
+                    WHERE m.normalized_brand_name = 'aldigesic sp'
+                    ORDER BY m.ingredient_order
+                    """
+                ).fetchall()
+
+            self.assertEqual(
+                rows,
+                [("aceclofenac",), ("acetaminophen",), ("serratiopeptidase",)],
+            )
 
     def _write_common_medicines_fixture(self, path: Path) -> None:
         fieldnames = [
@@ -126,6 +170,32 @@ class NormalizationArtifactTest(unittest.TestCase):
                 "source_basis": "fixture",
                 "source_urls": "https://example.test",
                 "dataset_note": "fixture",
+            },
+        ]
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _write_brand_ingredient_fixture(self, path: Path) -> None:
+        fieldnames = [
+            "brand_name",
+            "active_ingredients",
+            "strengths",
+            "region",
+            "source_basis",
+            "source_urls",
+            "notes",
+        ]
+        rows = [
+            {
+                "brand_name": "Aldigesic SP",
+                "active_ingredients": "aceclofenac|acetaminophen|serratiopeptidase",
+                "strengths": "100 mg|325 mg|10 mg",
+                "region": "india",
+                "source_basis": "fixture",
+                "source_urls": "https://example.test/aldigesic",
+                "notes": "fixture",
             },
         ]
         with path.open("w", newline="", encoding="utf-8") as handle:

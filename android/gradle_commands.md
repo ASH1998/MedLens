@@ -3,6 +3,30 @@
 This file records the Android and Gradle commands used while bringing up the
 native MedLens app in this repo.
 
+## Fresh debug APK rebuild
+
+Use this when you need to force a new `app-debug.apk` instead of letting Gradle
+reuse an existing up-to-date APK:
+
+```bash
+mkdir -p /tmp/medlens-gradle-home /tmp/medlens-gradle-tmp
+
+ANDROID_SDK_ROOT=$HOME/Android/Sdk \
+GRADLE_USER_HOME=/tmp/medlens-gradle-home \
+/home/ashu/github/MedLens/.gradle-dist/gradle-8.7/bin/gradle \
+  --no-daemon \
+  -Djava.io.tmpdir=/tmp/medlens-gradle-tmp \
+  --max-workers=2 \
+  :app:assembleDebug \
+  --rerun-tasks
+```
+
+Successful fresh debug APK output:
+
+```text
+android/app/build/outputs/apk/debug/app-debug.apk
+```
+
 ## Environment
 
 These are the Android SDK environment variables expected in the shell:

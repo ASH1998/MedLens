@@ -9,11 +9,38 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from pathlib import Path
 
 from medlens.artifacts.build_normalization import normalize_lookup_text
+
+NSAID_CANONICALS = {
+    "aceclofenac",
+    "aspirin",
+    "celecoxib",
+    "diclofenac",
+    "etoricoxib",
+    "ibuprofen",
+    "indomethacin",
+    "ketoprofen",
+    "ketorolac",
+    "meloxicam",
+    "naproxen",
+    "nimesulide",
+    "piroxicam",
+}
+ANTICOAGULANT_ANTIPLATELET_CANONICALS = {
+    "apixaban",
+    "aspirin",
+    "clopidogrel",
+    "dabigatran",
+    "edoxaban",
+    "prasugrel",
+    "rivaroxaban",
+    "ticagrelor",
+    "warfarin",
+}
 
 
 @dataclass(frozen=True)
@@ -57,6 +84,27 @@ class RawDdiSignal:
 
 
 @dataclass(frozen=True)
+class PracticalGuidance:
+    rule_id: str
+    practical_risk_tier: str
+    practical_summary: str
+    dose_context_needed: str
+    risk_factor_questions: str
+    source_urls: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DuplicateIngredientWarning:
+    ingredient: str
+    input_names: tuple[str, ...]
+    practical_risk_tier: str
+    practical_summary: str
+    dose_context_needed: str
+    risk_factor_questions: str
+    source_urls: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class KnownInteraction:
     found: bool
     drug_a: str
@@ -74,6 +122,7 @@ class KnownInteraction:
     effects: tuple[InteractionEffect, ...] = ()
     raw_signals: tuple[RawDdiSignal, ...] = ()
     evidence_source: str = "ddi_reference"
+    practical_guidance: PracticalGuidance | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +139,7 @@ class MedicationSafetyReport:
     unresolved_medications: tuple[NormalizedMedication, ...]
     checked_pair_count: int
     findings: tuple[KnownInteraction, ...]
+    duplicate_ingredient_warnings: tuple[DuplicateIngredientWarning, ...]
     overall_severity: str
     evidence_status: str
     limitations: tuple[str, ...]
@@ -101,6 +151,10 @@ class MedicationSafetyReport:
             "unresolved_medications": [_normalized_medication_to_dict(item) for item in self.unresolved_medications],
             "checked_pair_count": self.checked_pair_count,
             "findings": [_known_interaction_to_dict(finding) for finding in self.findings],
+            "duplicate_ingredient_warnings": [
+                _duplicate_ingredient_warning_to_dict(warning)
+                for warning in self.duplicate_ingredient_warnings
+            ],
             "overall_severity": self.overall_severity,
             "evidence_status": self.evidence_status,
             "limitations": list(self.limitations),
@@ -127,6 +181,28 @@ class MedicationSafetyStore:
         with sqlite3.connect(self.normalization_db) as conn:
             for name in names:
                 normalized_input = normalize_lookup_text(name)
+                ingredient_rows = []
+                for candidate in _ingredient_map_candidates(normalized_input):
+                    ingredient_rows = _ingredient_rows_for_candidate(conn, candidate)
+                    if not ingredient_rows:
+                        fuzzy_candidate = _fuzzy_brand_candidate(conn, candidate)
+                        if fuzzy_candidate is not None:
+                            ingredient_rows = _ingredient_rows_for_candidate(conn, fuzzy_candidate)
+                    if ingredient_rows:
+                        break
+                if ingredient_rows:
+                    for drug_id, canonical_name, matched_alias in ingredient_rows:
+                        results.append(
+                            NormalizedMedication(
+                                input_name=name,
+                                normalized_input=normalized_input,
+                                canonical_name=str(canonical_name),
+                                drug_id=int(drug_id),
+                                matched_alias=str(matched_alias),
+                                resolved=True,
+                            )
+                        )
+                    continue
                 row = conn.execute(
                     """
                     SELECT d.id, d.canonical_name, a.alias
@@ -655,7 +731,7 @@ class MedicationSafetyStore:
                     )
                 )
 
-        return KnownInteraction(
+        interaction = KnownInteraction(
             found=True,
             drug_a=str(row["drug_a"]),
             drug_b=str(row["drug_b"]),
@@ -671,6 +747,10 @@ class MedicationSafetyStore:
             use_case_notes=_json_tuple(row["use_case_notes_json"]),
             effects=effects,
             raw_signals=raw_signals,
+        )
+        return replace(
+            interaction,
+            practical_guidance=self._practical_guidance_for_pair(interaction.drug_a, interaction.drug_b),
         )
 
     def list_interactions_for_drug(
@@ -824,6 +904,7 @@ class MedicationSafetyStore:
                 findings.append(interaction)
 
         ranked_findings = tuple(sorted(findings, key=_interaction_sort_key))
+        duplicate_warnings = _duplicate_ingredient_warnings(normalized)
         overall_severity = _overall_severity(ranked_findings)
         limitations = _report_limitations(unresolved, checked_pair_count, ranked_findings)
 
@@ -833,10 +914,44 @@ class MedicationSafetyStore:
             unresolved_medications=unresolved,
             checked_pair_count=checked_pair_count,
             findings=ranked_findings,
+            duplicate_ingredient_warnings=duplicate_warnings,
             overall_severity=overall_severity,
             evidence_status=_evidence_status(ranked_findings, unresolved, checked_pair_count),
             limitations=limitations,
         )
+
+    def _practical_guidance_for_pair(self, drug_a: str, drug_b: str) -> PracticalGuidance | None:
+        if not self.normalization_db.exists():
+            return None
+
+        keys = _guidance_lookup_keys(drug_a, drug_b)
+        if not keys:
+            return None
+        with sqlite3.connect(self.normalization_db) as conn:
+            conn.row_factory = sqlite3.Row
+            if not _relation_exists(conn, "practical_pair_guidance"):
+                return None
+            for left_key, right_key in keys:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM practical_pair_guidance
+                    WHERE left_key = ? AND right_key = ?
+                    ORDER BY CASE match_type WHEN 'exact' THEN 0 ELSE 1 END
+                    LIMIT 1
+                    """,
+                    tuple(sorted((left_key, right_key))),
+                ).fetchone()
+                if row is not None:
+                    return PracticalGuidance(
+                        rule_id=str(row["rule_id"]),
+                        practical_risk_tier=str(row["practical_risk_tier"]),
+                        practical_summary=str(row["practical_summary"]),
+                        dose_context_needed=str(row["dose_context_needed"]),
+                        risk_factor_questions=str(row["risk_factor_questions"]),
+                        source_urls=_pipe_tuple(str(row["source_urls"])),
+                    )
+        return None
 
     def bulk_check_pairs(
         self,
@@ -1138,6 +1253,29 @@ def _raw_ddi_signal_to_dict(raw: RawDdiSignal) -> dict[str, object]:
     }
 
 
+def _practical_guidance_to_dict(guidance: PracticalGuidance) -> dict[str, object]:
+    return {
+        "rule_id": guidance.rule_id,
+        "practical_risk_tier": guidance.practical_risk_tier,
+        "practical_summary": guidance.practical_summary,
+        "dose_context_needed": guidance.dose_context_needed,
+        "risk_factor_questions": guidance.risk_factor_questions,
+        "source_urls": list(guidance.source_urls),
+    }
+
+
+def _duplicate_ingredient_warning_to_dict(warning: DuplicateIngredientWarning) -> dict[str, object]:
+    return {
+        "ingredient": warning.ingredient,
+        "input_names": list(warning.input_names),
+        "practical_risk_tier": warning.practical_risk_tier,
+        "practical_summary": warning.practical_summary,
+        "dose_context_needed": warning.dose_context_needed,
+        "risk_factor_questions": warning.risk_factor_questions,
+        "source_urls": list(warning.source_urls),
+    }
+
+
 def _common_medicine_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
     return {
         "medicine_id": str(row["medicine_id"]),
@@ -1160,7 +1298,7 @@ def _common_medicine_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
 
 
 def _known_interaction_to_dict(interaction: KnownInteraction) -> dict[str, object]:
-    return {
+    payload = {
         "found": interaction.found,
         "evidence_source": interaction.evidence_source,
         "drug_a": interaction.drug_a,
@@ -1178,6 +1316,147 @@ def _known_interaction_to_dict(interaction: KnownInteraction) -> dict[str, objec
         "effects": [_interaction_effect_to_dict(effect) for effect in interaction.effects],
         "raw_signals": [_raw_ddi_signal_to_dict(raw) for raw in interaction.raw_signals],
     }
+    if interaction.practical_guidance is not None:
+        payload["practical_guidance"] = _practical_guidance_to_dict(interaction.practical_guidance)
+    return payload
+
+
+def _duplicate_ingredient_warnings(
+    normalized: tuple[NormalizedMedication, ...],
+) -> tuple[DuplicateIngredientWarning, ...]:
+    by_ingredient: dict[str, set[str]] = {}
+    for item in normalized:
+        if item.resolved and item.canonical_name:
+            by_ingredient.setdefault(item.canonical_name, set()).add(item.input_name)
+
+    warnings: list[DuplicateIngredientWarning] = []
+    for ingredient, input_names in sorted(by_ingredient.items()):
+        if len(input_names) < 2:
+            continue
+        summary = (
+            "Acetaminophen/paracetamol appears in more than one product. The main practical risk is taking too much total "
+            "acetaminophen/paracetamol across the day, especially with other cold, flu, fever, or pain medicines."
+            if ingredient == "acetaminophen"
+            else f"{ingredient} appears in more than one product. This can turn an intended combination into duplicate dosing."
+        )
+        warnings.append(
+            DuplicateIngredientWarning(
+                ingredient=ingredient,
+                input_names=tuple(sorted(input_names)),
+                practical_risk_tier="duplicate_dose_risk",
+                practical_summary=summary,
+                dose_context_needed="Ask the dose, frequency, duration, and whether any other medicine contains the same active ingredient.",
+                risk_factor_questions="Liver disease or heavy alcohol use for acetaminophen/paracetamol; kidney disease, ulcer/bleeding history, or blood thinner use for NSAIDs.",
+                source_urls=(
+                    "https://www.nhsinform.scot/tests-and-treatments/medicines-and-medical-aids/types-of-medicine/ibuprofen",
+                    "https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/813026/national_pain_relief_poster_including_child_doses_v29.pdf",
+                ),
+            )
+        )
+    return tuple(warnings)
+
+
+def _guidance_lookup_keys(drug_a: str, drug_b: str) -> tuple[tuple[str, str], ...]:
+    keys: list[tuple[str, str]] = [(normalize_lookup_text(drug_a), normalize_lookup_text(drug_b))]
+    class_a = _drug_classes(drug_a)
+    class_b = _drug_classes(drug_b)
+    for left_class in class_a:
+        keys.append((left_class, normalize_lookup_text(drug_b)))
+    for right_class in class_b:
+        keys.append((normalize_lookup_text(drug_a), right_class))
+    for left_class in class_a:
+        for right_class in class_b:
+            keys.append((left_class, right_class))
+    deduped: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for left, right in keys:
+        ordered = tuple(sorted((left, right)))
+        if left and right and ordered not in seen:
+            seen.add(ordered)
+            deduped.append(ordered)
+    return tuple(deduped)
+
+
+def _drug_classes(canonical_name: str) -> tuple[str, ...]:
+    normalized = normalize_lookup_text(canonical_name)
+    classes: list[str] = []
+    if normalized in NSAID_CANONICALS:
+        classes.append("nsaid")
+    if normalized in ANTICOAGULANT_ANTIPLATELET_CANONICALS:
+        classes.append("anticoagulant antiplatelet")
+    return tuple(classes)
+
+
+def _pipe_tuple(value: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in value.split("|") if part.strip())
+
+
+def _ingredient_map_candidates(normalized_input: str) -> tuple[str, ...]:
+    if not normalized_input:
+        return ()
+    candidates: set[str] = {normalized_input}
+    tokens = [token for token in normalized_input.split(" ") if token]
+    for window_size in range(1, min(5, len(tokens)) + 1):
+        for start in range(0, len(tokens) - window_size + 1):
+            candidates.add(" ".join(tokens[start : start + window_size]))
+    return tuple(sorted((item for item in candidates if len(item) >= 3), key=lambda item: (-len(item), item)))
+
+
+def _ingredient_rows_for_candidate(conn: sqlite3.Connection, normalized_candidate: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT d.id, d.canonical_name, m.brand_name
+        FROM medicine_ingredient_map m
+        JOIN drug d ON d.id = m.ingredient_drug_id
+        WHERE m.normalized_brand_name = ?
+        ORDER BY m.ingredient_order, d.canonical_name
+        """,
+        (normalized_candidate,),
+    ).fetchall()
+
+
+def _fuzzy_brand_candidate(conn: sqlite3.Connection, normalized_candidate: str) -> str | None:
+    if len(normalized_candidate) < 5:
+        return None
+    rows = conn.execute(
+        """
+        SELECT DISTINCT normalized_brand_name
+        FROM medicine_ingredient_map
+        WHERE length(normalized_brand_name) BETWEEN ? AND ?
+        """,
+        (len(normalized_candidate) - 2, len(normalized_candidate) + 2),
+    ).fetchall()
+    ranked = []
+    for (brand,) in rows:
+        brand_value = str(brand)
+        distance = _edit_distance(normalized_candidate, brand_value)
+        if (
+            distance <= max(1, min(2, len(brand_value) // 5))
+            and brand_value[:1] == normalized_candidate[:1]
+        ):
+            ranked.append((distance, len(brand_value), brand_value))
+    return sorted(ranked)[0][2] if ranked else None
+
+
+def _edit_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    previous = list(range(len(b) + 1))
+    current = [0] * (len(b) + 1)
+    for index_a, char_a in enumerate(a, start=1):
+        current[0] = index_a
+        for index_b, char_b in enumerate(b, start=1):
+            current[index_b] = min(
+                previous[index_b] + 1,
+                current[index_b - 1] + 1,
+                previous[index_b - 1] + (0 if char_a == char_b else 1),
+            )
+        previous, current = current, previous
+    return previous[len(b)]
 
 
 def _dedupe_resolved_medications(items: tuple[NormalizedMedication, ...]) -> tuple[NormalizedMedication, ...]:
