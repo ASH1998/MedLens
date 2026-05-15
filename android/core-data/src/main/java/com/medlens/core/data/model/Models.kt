@@ -43,6 +43,27 @@ data class RawDdiSignal(
 )
 
 @Serializable
+data class PracticalGuidance(
+    val rule_id: String,
+    val practical_risk_tier: String,
+    val practical_summary: String,
+    val dose_context_needed: String,
+    val risk_factor_questions: String,
+    val source_urls: List<String>,
+)
+
+@Serializable
+data class DuplicateIngredientWarning(
+    val ingredient: String,
+    val input_names: List<String>,
+    val practical_risk_tier: String,
+    val practical_summary: String,
+    val dose_context_needed: String,
+    val risk_factor_questions: String,
+    val source_urls: List<String>,
+)
+
+@Serializable
 data class KnownInteraction(
     val found: Boolean,
     val drug_a: String,
@@ -60,6 +81,7 @@ data class KnownInteraction(
     val effects: List<InteractionEffect>,
     val raw_signals: List<RawDdiSignal>,
     val evidence_source: String,
+    val practical_guidance: PracticalGuidance? = null,
 )
 
 @Serializable
@@ -69,6 +91,7 @@ data class MedicationSafetyReport(
     val unresolved_medications: List<NormalizedMedication>,
     val checked_pair_count: Int,
     val findings: List<KnownInteraction>,
+    val duplicate_ingredient_warnings: List<DuplicateIngredientWarning> = emptyList(),
     val overall_severity: String,
     val evidence_status: String,
     val limitations: List<String>,

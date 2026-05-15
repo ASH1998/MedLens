@@ -28,6 +28,7 @@ fun gradleStringLiteral(value: String): String = "\"${value.replace("\\", "\\\\"
 val syncMedlensAssets by tasks.registering(Copy::class) {
     from("../../data/artifacts/normalization.sqlite")
     from("../../data/artifacts/evidence.mobile.sqlite")
+    from("../../data/raw/DDI/india_common_brand_ingredient_map.csv")
     into(medlensAssetDir)
 }
 
@@ -39,8 +40,8 @@ android {
         applicationId = "com.medlens.android"
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 12
+        versionName = "0.1.12-pre-release"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
@@ -126,7 +127,7 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.4.0")
     implementation("androidx.camera:camera-view:1.4.0")
     implementation("com.google.mlkit:text-recognition:16.0.0")
-    implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

@@ -13,6 +13,8 @@ from medlens.artifacts.schema import NORMALIZATION_SCHEMA
 
 NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 COMMON_MEDICINES_INDIA_CSV = Path("data/raw/DDI/common_medicines_india_dataset_5000.csv")
+INDIA_BRAND_INGREDIENT_MAP_CSV = Path("data/raw/DDI/india_common_brand_ingredient_map.csv")
+PRACTICAL_PAIR_GUIDANCE_CSV = Path("data/raw/DDI/practical_pair_guidance.csv")
 SALT_SUFFIXES = (
     "hydrochloride",
     "sulfate",
@@ -92,6 +94,13 @@ def import_india_common_medicines(conn: sqlite3.Connection, csv_path: Path) -> i
 
             generic_aliases = _generic_aliases(generic_name)
             brand_aliases = _brand_aliases(_row_field(row, "common_brand_examples_india"))
+            brand_aliases = (
+                *brand_aliases,
+                *_brand_strength_aliases(
+                    brand_aliases,
+                    _row_field(row, "composition_or_strength_pattern"),
+                ),
+            )
             drug_id = _resolve_existing_drug_id(conn, (*generic_aliases, *brand_aliases))
             if drug_id is None:
                 canonical_name = normalize_lookup_text(generic_name)
@@ -155,6 +164,121 @@ def import_india_common_medicines(conn: sqlite3.Connection, csv_path: Path) -> i
                     _row_field(row, "source_basis"),
                     _row_field(row, "source_urls"),
                     _row_field(row, "dataset_note"),
+                ),
+            )
+            imported += 1
+    return imported
+
+
+def import_brand_ingredient_map(conn: sqlite3.Connection, csv_path: Path) -> int:
+    """Import curated brand-to-active-ingredient mappings for combination products."""
+    if not csv_path.exists():
+        return 0
+
+    imported = 0
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            brand_name = _row_field(row, "brand_name")
+            ingredients = tuple(
+                item.strip()
+                for item in _row_field(row, "active_ingredients").split("|")
+                if normalize_lookup_text(item)
+            )
+            if not brand_name or not ingredients:
+                continue
+
+            strengths = tuple(item.strip() for item in _row_field(row, "strengths").split("|"))
+            normalized_brand = normalize_lookup_text(brand_name)
+            region = _row_field(row, "region") or "india"
+            source_basis = _row_field(row, "source_basis")
+            source_urls = _row_field(row, "source_urls")
+            ingredient_drug_ids: list[int] = []
+
+            for ingredient in ingredients:
+                drug_id = _resolve_existing_drug_id(conn, (ingredient,))
+                if drug_id is None:
+                    ingredient_drug_ids = []
+                    break
+                ingredient_drug_ids.append(drug_id)
+
+            if not ingredient_drug_ids:
+                continue
+
+            for index, drug_id in enumerate(ingredient_drug_ids):
+                conn.execute(
+                    """
+                    INSERT INTO medicine_ingredient_map (
+                        brand_name, normalized_brand_name, ingredient_drug_id,
+                        ingredient_order, strength, region, source_basis, source_urls
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(normalized_brand_name, ingredient_drug_id) DO UPDATE SET
+                        brand_name = excluded.brand_name,
+                        ingredient_order = excluded.ingredient_order,
+                        strength = excluded.strength,
+                        region = excluded.region,
+                        source_basis = excluded.source_basis,
+                        source_urls = excluded.source_urls
+                    """,
+                    (
+                        brand_name,
+                        normalized_brand,
+                        drug_id,
+                        index,
+                        strengths[index] if index < len(strengths) else "",
+                        region,
+                        source_basis,
+                        source_urls,
+                    ),
+                )
+            imported += 1
+    return imported
+
+
+def import_practical_pair_guidance(conn: sqlite3.Connection, csv_path: Path) -> int:
+    """Import deterministic patient-facing interpretation rules for common pairs/classes."""
+    if not csv_path.exists():
+        return 0
+
+    imported = 0
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            rule_id = _row_field(row, "rule_id")
+            left_key = normalize_lookup_text(_row_field(row, "left_key"))
+            right_key = normalize_lookup_text(_row_field(row, "right_key"))
+            practical_summary = _row_field(row, "practical_summary")
+            if not rule_id or not left_key or not right_key or not practical_summary:
+                continue
+            ordered = tuple(sorted((left_key, right_key)))
+            conn.execute(
+                """
+                INSERT INTO practical_pair_guidance (
+                    rule_id, left_key, right_key, match_type, practical_risk_tier,
+                    practical_summary, dose_context_needed, risk_factor_questions, source_urls
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(rule_id) DO UPDATE SET
+                    left_key = excluded.left_key,
+                    right_key = excluded.right_key,
+                    match_type = excluded.match_type,
+                    practical_risk_tier = excluded.practical_risk_tier,
+                    practical_summary = excluded.practical_summary,
+                    dose_context_needed = excluded.dose_context_needed,
+                    risk_factor_questions = excluded.risk_factor_questions,
+                    source_urls = excluded.source_urls
+                """,
+                (
+                    rule_id,
+                    ordered[0],
+                    ordered[1],
+                    _row_field(row, "match_type") or "class",
+                    _row_field(row, "practical_risk_tier") or "conditional",
+                    practical_summary,
+                    _row_field(row, "dose_context_needed"),
+                    _row_field(row, "risk_factor_questions"),
+                    _row_field(row, "source_urls"),
                 ),
             )
             imported += 1
@@ -252,6 +376,31 @@ def _brand_aliases(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(aliases))
 
 
+def _brand_strength_aliases(brand_aliases: tuple[str, ...], composition: str) -> tuple[str, ...]:
+    strengths = tuple(
+        dict.fromkeys(
+            match.group(1).lstrip("0") or "0"
+            for match in re.finditer(
+                r"\b(\d+(?:\.\d+)?)\s*(?:mg|mcg|g|ml|iu)\b",
+                composition,
+                flags=re.IGNORECASE,
+            )
+        )
+    )
+    if not strengths:
+        return ()
+
+    aliases: list[str] = []
+    for brand in brand_aliases:
+        normalized_brand = normalize_lookup_text(brand)
+        if not normalized_brand:
+            continue
+        for strength in strengths[:4]:
+            aliases.append(f"{brand} {strength}")
+            aliases.append(f"{brand}{strength}")
+    return tuple(dict.fromkeys(aliases))
+
+
 def _category_from_text(value: str) -> str:
     normalized = normalize_lookup_text(value)
     return normalized.replace(" ", "_") or "india_common_medicine"
@@ -261,8 +410,14 @@ def _row_field(row: dict[str, str], column: str) -> str:
     return (row.get(column) or "").strip()
 
 
-def build_normalization_db(output: Path, common_medicines_csv: Path | None = COMMON_MEDICINES_INDIA_CSV) -> None:
+def build_normalization_db(
+    output: Path,
+    common_medicines_csv: Path | None = COMMON_MEDICINES_INDIA_CSV,
+    brand_ingredient_map_csv: Path | None = INDIA_BRAND_INGREDIENT_MAP_CSV,
+    practical_pair_guidance_csv: Path | None = PRACTICAL_PAIR_GUIDANCE_CSV,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
+    output.unlink(missing_ok=True)
     with sqlite3.connect(output) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         create_schema(conn)
@@ -270,6 +425,10 @@ def build_normalization_db(output: Path, common_medicines_csv: Path | None = COM
             insert_seed(conn, seed)
         if common_medicines_csv is not None:
             import_india_common_medicines(conn, common_medicines_csv)
+        if brand_ingredient_map_csv is not None:
+            import_brand_ingredient_map(conn, brand_ingredient_map_csv)
+        if practical_pair_guidance_csv is not None:
+            import_practical_pair_guidance(conn, practical_pair_guidance_csv)
         conn.commit()
         conn.execute("PRAGMA optimize")
 
@@ -295,12 +454,29 @@ def parse_args() -> argparse.Namespace:
         default=COMMON_MEDICINES_INDIA_CSV,
         help="Optional India common medicines CSV to import for OCR/user-name recovery.",
     )
+    parser.add_argument(
+        "--brand-ingredient-map-csv",
+        type=Path,
+        default=INDIA_BRAND_INGREDIENT_MAP_CSV,
+        help="Optional curated brand-to-active-ingredient CSV for combination products.",
+    )
+    parser.add_argument(
+        "--practical-pair-guidance-csv",
+        type=Path,
+        default=PRACTICAL_PAIR_GUIDANCE_CSV,
+        help="Optional curated class/pair guidance CSV for patient-facing interpretation.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    build_normalization_db(args.output, args.common_medicines_csv)
+    build_normalization_db(
+        args.output,
+        args.common_medicines_csv,
+        args.brand_ingredient_map_csv,
+        args.practical_pair_guidance_csv,
+    )
     drug_count, alias_count = artifact_stats(args.output)
     print(f"Built {args.output}")
     print(f"Drugs: {drug_count}")

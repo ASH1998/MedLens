@@ -21,15 +21,29 @@ data class ToolModelResponse(
 data class AgentMessage(
     val role: String,
     val content: String,
+    val tool_calls: List<ToolCall> = emptyList(),
+    val tool_call_id: String? = null,
+    val name: String? = null,
 )
+
+data class ToolResultPayload(
+    val name: String,
+    val content: String,
+)
+
+interface TurnSession : AutoCloseable {
+    suspend fun sendUser(content: String): ToolModelResponse
+    suspend fun sendToolResults(results: List<ToolResultPayload>): ToolModelResponse
+    override fun close()
+}
 
 interface NativeToolProvider {
     val name: String
-    suspend fun generateWithTools(
+    suspend fun startTurn(
         systemPrompt: String,
-        messages: List<AgentMessage>,
+        priorTranscript: List<AgentMessage>,
         tools: List<ToolSchema>,
-    ): ToolModelResponse
+    ): TurnSession
 }
 
 @Serializable
@@ -57,6 +71,7 @@ data class ChatSession(
 data class ToolSchema(
     val name: String,
     val description: String,
+    val inputSchemaJson: String = """{"type":"object","properties":{}}""",
 )
 
 @Serializable
@@ -66,5 +81,4 @@ data class AgentTurnResult(
     val report: MedicationSafetyReport?,
     val usedTools: List<String>,
     val providerName: String,
-    val fallbackUsed: Boolean,
 )

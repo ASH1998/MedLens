@@ -5,12 +5,14 @@ import android.database.sqlite.SQLiteDatabase
 import com.medlens.core.data.model.AliasSearchResult
 import com.medlens.core.data.model.CommonMedicineProfile
 import com.medlens.core.data.model.CommonMedicineRow
+import com.medlens.core.data.model.DuplicateIngredientWarning
 import com.medlens.core.data.model.DrugInteractionList
 import com.medlens.core.data.model.EvidenceImportFile
 import com.medlens.core.data.model.InteractionEffect
 import com.medlens.core.data.model.KnownInteraction
 import com.medlens.core.data.model.MedicationSafetyReport
 import com.medlens.core.data.model.NormalizedMedication
+import com.medlens.core.data.model.PracticalGuidance
 import com.medlens.core.data.model.RawDdiSignal
 import com.medlens.core.data.util.normalizeLookupText
 import kotlinx.coroutines.Dispatchers
@@ -18,6 +20,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import java.io.File
 import kotlin.math.max
 import kotlin.math.min
 
@@ -28,31 +31,39 @@ class SqliteSafetyRepository(
     private val openMutex = Mutex()
     private var normalizationDb: SQLiteDatabase? = null
     private var evidenceDb: SQLiteDatabase? = null
+    private val brandIngredientMap: Map<String, BrandIngredientEntry> by lazy {
+        loadBrandIngredientMap(installedDatabases.brandIngredientMapPath)
+    }
 
     override suspend fun normalizeMedications(names: List<String>): List<NormalizedMedication> =
         withContext(Dispatchers.IO) {
             val db = normalizationDb()
-            names.map { name ->
+            names.flatMap { name ->
                 val normalizedInput = normalizeLookupText(name)
-                db.rawQuery(
-                    """
-                    SELECT d.id AS id, d.canonical_name AS canonical_name, a.alias AS alias
-                    FROM drug_alias a
-                    JOIN drug d ON d.id = a.drug_id
-                    WHERE a.normalized_alias = ?
-                    """.trimIndent(),
-                    arrayOf(normalizedInput),
-                ).use { cursor ->
-                    if (cursor.moveToFirst()) {
+                val ingredientMatches = ingredientMapCandidates(normalizedInput).firstNotNullOfOrNull { candidate ->
+                    lookupFileIngredientMap(db, candidate, normalizedInput, name)
+                        .ifEmpty { lookupIngredientMap(db, candidate, normalizedInput, name) }
+                        .takeIf { it.isNotEmpty() }
+                }.orEmpty()
+                if (ingredientMatches.isNotEmpty()) {
+                    return@flatMap ingredientMatches
+                }
+                val match = normalizationCandidates(normalizedInput).firstNotNullOfOrNull { candidate ->
+                    lookupAlias(db, candidate)
+                }
+                if (match != null) {
+                    listOf(
                         NormalizedMedication(
                             input_name = name,
                             normalized_input = normalizedInput,
-                            canonical_name = cursor.string("canonical_name"),
-                            drug_id = cursor.long("id"),
-                            matched_alias = cursor.string("alias"),
+                            canonical_name = match.canonicalName,
+                            drug_id = match.drugId,
+                            matched_alias = match.alias,
                             resolved = true,
-                        )
-                    } else {
+                        ),
+                    )
+                } else {
+                    listOf(
                         NormalizedMedication(
                             input_name = name,
                             normalized_input = normalizedInput,
@@ -60,11 +71,141 @@ class SqliteSafetyRepository(
                             drug_id = null,
                             matched_alias = null,
                             resolved = false,
-                        )
-                    }
+                        ),
+                    )
                 }
             }
         }
+
+    private fun lookupFileIngredientMap(
+        db: SQLiteDatabase,
+        normalizedCandidate: String,
+        normalizedOriginal: String,
+        originalInput: String,
+    ): List<NormalizedMedication> {
+        val entry = brandIngredientMap[normalizedCandidate]
+            ?: fuzzyBrandIngredientEntry(normalizedCandidate)
+            ?: return emptyList()
+        val matches = entry.ingredients.map { ingredient ->
+            val normalizedIngredient = normalizeLookupText(ingredient)
+            val match = normalizationCandidates(normalizedIngredient).firstNotNullOfOrNull { candidate ->
+                lookupAlias(db, candidate)
+            }
+            if (match != null) {
+                NormalizedMedication(
+                    input_name = originalInput,
+                    normalized_input = normalizedOriginal,
+                    canonical_name = match.canonicalName,
+                    drug_id = match.drugId,
+                    matched_alias = entry.brandName,
+                    resolved = true,
+                )
+            } else {
+                NormalizedMedication(
+                    input_name = originalInput,
+                    normalized_input = normalizedOriginal,
+                    canonical_name = null,
+                    drug_id = null,
+                    matched_alias = entry.brandName,
+                    resolved = false,
+                )
+            }
+        }
+        return if (matches.all { it.resolved }) matches else emptyList()
+    }
+
+    private fun lookupIngredientMap(
+        db: SQLiteDatabase,
+        normalizedCandidate: String,
+        normalizedOriginal: String,
+        originalInput: String,
+    ): List<NormalizedMedication> =
+        db.rawQuery(
+            """
+            SELECT d.id AS id, d.canonical_name AS canonical_name, m.brand_name AS brand_name
+            FROM medicine_ingredient_map m
+            JOIN drug d ON d.id = m.ingredient_drug_id
+            WHERE m.normalized_brand_name = ?
+            ORDER BY m.ingredient_order, d.canonical_name
+            """.trimIndent(),
+            arrayOf(normalizedCandidate),
+        ).use { cursor ->
+            val matches = mutableListOf<NormalizedMedication>()
+            while (cursor.moveToNext()) {
+                matches += NormalizedMedication(
+                    input_name = originalInput,
+                    normalized_input = normalizedOriginal,
+                    canonical_name = cursor.string("canonical_name"),
+                    drug_id = cursor.long("id"),
+                    matched_alias = cursor.string("brand_name"),
+                    resolved = true,
+                )
+            }
+            matches
+        }
+
+    private fun ingredientMapCandidates(normalizedInput: String): List<String> {
+        if (normalizedInput.isBlank()) return emptyList()
+        val candidates = linkedSetOf<String>()
+        candidates += normalizedInput
+        val tokens = normalizedInput.split(" ").filter { it.isNotBlank() }
+        for (windowSize in 1..min(5, tokens.size)) {
+            for (start in 0..tokens.size - windowSize) {
+                candidates += tokens.drop(start).take(windowSize).joinToString(" ")
+            }
+        }
+        return candidates
+            .filter { it.length >= 3 }
+            .sortedWith(compareByDescending<String> { it.length }.thenBy { it })
+    }
+
+    private fun fuzzyBrandIngredientEntry(normalizedCandidate: String): BrandIngredientEntry? {
+        if (normalizedCandidate.length < 5) return null
+        val ranked = brandIngredientMap.entries
+            .asSequence()
+            .filter { (key, _) -> kotlin.math.abs(key.length - normalizedCandidate.length) <= 2 }
+            .map { (key, entry) -> Triple(key, entry, editDistance(normalizedCandidate, key)) }
+            .filter { (key, _, distance) ->
+                distance <= max(1, min(2, key.length / 5)) &&
+                    key.firstOrNull() == normalizedCandidate.firstOrNull()
+            }
+            .sortedWith(compareBy<Triple<String, BrandIngredientEntry, Int>> { it.third }.thenBy { it.first.length })
+            .firstOrNull()
+        return ranked?.second
+    }
+
+    private fun lookupAlias(db: SQLiteDatabase, normalizedInput: String): AliasLookup? =
+        db.rawQuery(
+            """
+            SELECT d.id AS id, d.canonical_name AS canonical_name, a.alias AS alias
+            FROM drug_alias a
+            JOIN drug d ON d.id = a.drug_id
+            WHERE a.normalized_alias = ?
+            """.trimIndent(),
+            arrayOf(normalizedInput),
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            AliasLookup(
+                drugId = cursor.long("id"),
+                canonicalName = cursor.string("canonical_name"),
+                alias = cursor.string("alias"),
+            )
+        }
+
+    private fun normalizationCandidates(normalizedInput: String): List<String> {
+        if (normalizedInput.isBlank()) return emptyList()
+        val candidates = linkedSetOf(normalizedInput)
+        val spacedDose = normalizedInput
+            .replace(Regex("([a-z])([0-9])"), "$1 $2")
+            .replace(Regex("([0-9])([a-z])"), "$1 $2")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        candidates += spacedDose
+        candidates += spacedDose
+            .replace(Regex("\\s+(mg|mcg|g|ml|iu)$"), "")
+            .trim()
+        return candidates.filter { it.isNotBlank() }
+    }
 
     override suspend fun searchDrugAliases(query: String, limit: Int): List<AliasSearchResult> =
         withContext(Dispatchers.IO) {
@@ -172,50 +313,74 @@ class SqliteSafetyRepository(
         effectLimit: Int,
         rawSignalLimit: Int,
     ): KnownInteraction = withContext(Dispatchers.IO) {
-        val normalized = normalizeMedications(listOf(drugA, drugB))
-        val left = normalized[0]
-        val right = normalized[1]
-        val pairA = left.canonical_name ?: left.normalized_input
-        val pairB = right.canonical_name ?: right.normalized_input
-        val sorted = listOf(pairA, pairB).sorted()
-        if (!left.resolved || !right.resolved) {
+        val leftOptions = normalizeMedications(listOf(drugA)).filter { it.resolved && it.canonical_name != null }
+        val rightOptions = normalizeMedications(listOf(drugB)).filter { it.resolved && it.canonical_name != null }
+        if (leftOptions.isEmpty() || rightOptions.isEmpty()) {
+            val sorted = listOf(normalizeLookupText(drugA), normalizeLookupText(drugB)).sorted()
             return@withContext notFound(sorted[0], sorted[1])
         }
 
         val db = evidenceDb()
-        db.rawQuery(
-            "SELECT * FROM known_interaction WHERE drug_a = ? AND drug_b = ?",
-            arrayOf(sorted[0], sorted[1]),
-        ).use { cursor ->
-            if (!cursor.moveToFirst()) {
-                return@withContext notFound(sorted[0], sorted[1])
+        val normalization = normalizationDb()
+        val findings = mutableListOf<KnownInteraction>()
+        for (left in leftOptions) {
+            for (right in rightOptions) {
+                if (left.canonical_name == right.canonical_name) continue
+                val sorted = listOf(left.canonical_name, right.canonical_name).filterNotNull().sorted()
+                db.rawQuery(
+                    "SELECT * FROM known_interaction WHERE drug_a = ? AND drug_b = ?",
+                    arrayOf(sorted[0], sorted[1]),
+                ).use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        findings += knownInteractionFromCursor(db, normalization, cursor, effectLimit, rawSignalLimit)
+                    }
+                }
             }
-            val interactionId = cursor.long("id")
-            val effects = selectEffects(db, interactionId, effectLimit)
-            val rawSignals = if (rawSignalLimit > 0) {
-                selectRawSignals(db, interactionId, rawSignalLimit)
-            } else {
-                emptyList()
-            }
-            KnownInteraction(
-                found = true,
-                drug_a = cursor.string("drug_a"),
-                drug_b = cursor.string("drug_b"),
-                severity = cursor.string("severity"),
-                row_count = cursor.int("row_count"),
-                source_regions = jsonList(cursor.string("source_regions_json")),
-                evidence_bases = jsonList(cursor.string("evidence_bases_json")),
-                source_bases = jsonList(cursor.string("source_bases_json")),
-                source_urls = jsonList(cursor.string("source_urls_json")),
-                mechanisms = jsonList(cursor.string("mechanisms_json")),
-                risk_flags = jsonList(cursor.string("risk_flags_json")),
-                dataset_types = jsonList(cursor.string("dataset_types_json")),
-                use_case_notes = jsonList(cursor.string("use_case_notes_json")),
-                effects = effects,
-                raw_signals = rawSignals,
-                evidence_source = "ddi_reference",
-            )
         }
+        findings.sortedWith(
+            compareByDescending<KnownInteraction> { severityRank(it.severity) }
+                .thenByDescending { it.row_count }
+                .thenBy { it.drug_a }
+                .thenBy { it.drug_b },
+        ).firstOrNull() ?: notFound(
+            leftOptions.first().canonical_name ?: normalizeLookupText(drugA),
+            rightOptions.first().canonical_name ?: normalizeLookupText(drugB),
+        )
+    }
+
+    private fun knownInteractionFromCursor(
+        db: SQLiteDatabase,
+        normalization: SQLiteDatabase,
+        cursor: Cursor,
+        effectLimit: Int,
+        rawSignalLimit: Int,
+    ): KnownInteraction {
+        val interactionId = cursor.long("id")
+        val effects = selectEffects(db, interactionId, effectLimit)
+        val rawSignals = if (rawSignalLimit > 0) {
+            selectRawSignals(db, interactionId, rawSignalLimit)
+        } else {
+            emptyList()
+        }
+        return KnownInteraction(
+            found = true,
+            drug_a = cursor.string("drug_a"),
+            drug_b = cursor.string("drug_b"),
+            severity = cursor.string("severity"),
+            row_count = cursor.int("row_count"),
+            source_regions = jsonList(cursor.string("source_regions_json")),
+            evidence_bases = jsonList(cursor.string("evidence_bases_json")),
+            source_bases = jsonList(cursor.string("source_bases_json")),
+            source_urls = jsonList(cursor.string("source_urls_json")),
+            mechanisms = jsonList(cursor.string("mechanisms_json")),
+            risk_flags = jsonList(cursor.string("risk_flags_json")),
+            dataset_types = jsonList(cursor.string("dataset_types_json")),
+            use_case_notes = jsonList(cursor.string("use_case_notes_json")),
+            effects = effects,
+            raw_signals = rawSignals,
+            evidence_source = "ddi_reference",
+            practical_guidance = practicalGuidanceForPair(normalization, cursor.string("drug_a"), cursor.string("drug_b")),
+        )
     }
 
     override suspend fun listInteractionsForDrug(
@@ -296,10 +461,45 @@ class SqliteSafetyRepository(
             unresolved_medications = unresolved,
             checked_pair_count = checkedPairCount,
             findings = ranked,
+            duplicate_ingredient_warnings = duplicateIngredientWarnings(normalized),
             overall_severity = overallSeverity(ranked),
             evidence_status = evidenceStatus(ranked, unresolved, checkedPairCount),
             limitations = reportLimitations(unresolved, checkedPairCount, ranked),
         )
+    }
+
+    private fun practicalGuidanceForPair(
+        db: SQLiteDatabase,
+        drugA: String,
+        drugB: String,
+    ): PracticalGuidance? {
+        val keys = guidanceLookupKeys(drugA, drugB)
+        if (keys.isEmpty()) return null
+        if (!tableExists(db, "practical_pair_guidance")) return null
+        for ((leftKey, rightKey) in keys) {
+            db.rawQuery(
+                """
+                SELECT *
+                FROM practical_pair_guidance
+                WHERE left_key = ? AND right_key = ?
+                ORDER BY CASE match_type WHEN 'exact' THEN 0 ELSE 1 END
+                LIMIT 1
+                """.trimIndent(),
+                arrayOf(leftKey, rightKey),
+            ).use { cursor ->
+                if (cursor.moveToFirst()) {
+                    return PracticalGuidance(
+                        rule_id = cursor.string("rule_id"),
+                        practical_risk_tier = cursor.string("practical_risk_tier"),
+                        practical_summary = cursor.string("practical_summary"),
+                        dose_context_needed = cursor.string("dose_context_needed"),
+                        risk_factor_questions = cursor.string("risk_factor_questions"),
+                        source_urls = cursor.string("source_urls").split("|").map { it.trim() }.filter { it.isNotBlank() },
+                    )
+                }
+            }
+        }
+        return null
     }
 
     override suspend fun getCommonMedicineProfile(
@@ -358,12 +558,12 @@ class SqliteSafetyRepository(
             }
         }
 
-        val fallback = if (matches.isEmpty()) searchCommonMedicines(name, limit = limit) else emptyList()
+        val profileSearchMatches = if (matches.isEmpty()) searchCommonMedicines(name, limit = limit) else emptyList()
         CommonMedicineProfile(
             query = name,
             normalized = normalized,
             aliases = aliases.distinct(),
-            matches = if (matches.isEmpty()) fallback else matches,
+            matches = if (matches.isEmpty()) profileSearchMatches else matches,
         )
     }
 
@@ -663,7 +863,7 @@ class SqliteSafetyRepository(
         findings: List<KnownInteraction>,
     ): List<String> {
         val items = mutableListOf(
-            "This report uses local DDI reference signals only; it is a screening output, not patient-specific medical advice.",
+            "This report uses curated DDI reference signals; it is a screening output, not patient-specific medical advice.",
         )
         if (unresolved.isNotEmpty()) {
             items += "Some medications could not be normalized and were not checked: ${unresolved.joinToString(", ") { it.input_name }}."
@@ -672,10 +872,73 @@ class SqliteSafetyRepository(
             items += "Fewer than two medications were resolved, so no pairwise interaction check was possible."
         }
         if (findings.isEmpty() && checkedPairCount > 0) {
-            items += "No known/reference DDI signal was found locally for the resolved medication pairs."
+            items += "No known/reference DDI signal was found for the resolved medication pairs."
         }
         return items
     }
+
+    private fun duplicateIngredientWarnings(normalized: List<NormalizedMedication>): List<DuplicateIngredientWarning> {
+        val grouped = normalized
+            .filter { it.resolved && it.canonical_name != null }
+            .groupBy { it.canonical_name.orEmpty() }
+            .mapValues { (_, items) -> items.map { it.input_name }.toSet().sorted() }
+
+        return grouped.entries
+            .filter { it.value.size > 1 }
+            .map { (ingredient, inputNames) ->
+                val summary = if (ingredient == "acetaminophen") {
+                    "Acetaminophen/paracetamol appears in more than one product. The main practical risk is taking too much total acetaminophen/paracetamol across the day, especially with other cold, flu, fever, or pain medicines."
+                } else {
+                    "$ingredient appears in more than one product. This can turn an intended combination into duplicate dosing."
+                }
+                DuplicateIngredientWarning(
+                    ingredient = ingredient,
+                    input_names = inputNames,
+                    practical_risk_tier = "duplicate_dose_risk",
+                    practical_summary = summary,
+                    dose_context_needed = "Ask the dose, frequency, duration, and whether any other medicine contains the same active ingredient.",
+                    risk_factor_questions = "Liver disease or heavy alcohol use for acetaminophen/paracetamol; kidney disease, ulcer/bleeding history, or blood thinner use for NSAIDs.",
+                    source_urls = listOf(
+                        "https://www.nhsinform.scot/tests-and-treatments/medicines-and-medical-aids/types-of-medicine/ibuprofen",
+                        "https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/813026/national_pain_relief_poster_including_child_doses_v29.pdf",
+                    ),
+                )
+            }
+    }
+
+    private fun guidanceLookupKeys(drugA: String, drugB: String): List<Pair<String, String>> {
+        val keys = mutableListOf(normalizeLookupText(drugA) to normalizeLookupText(drugB))
+        val leftClasses = drugClasses(drugA)
+        val rightClasses = drugClasses(drugB)
+        leftClasses.forEach { keys += it to normalizeLookupText(drugB) }
+        rightClasses.forEach { keys += normalizeLookupText(drugA) to it }
+        leftClasses.forEach { leftClass ->
+            rightClasses.forEach { rightClass ->
+                keys += leftClass to rightClass
+            }
+        }
+        val seen = mutableSetOf<Pair<String, String>>()
+        return keys.mapNotNull { (left, right) ->
+            if (left.isBlank() || right.isBlank()) return@mapNotNull null
+            val ordered = listOf(left, right).sorted()
+            val pair = ordered[0] to ordered[1]
+            if (seen.add(pair)) pair else null
+        }
+    }
+
+    private fun drugClasses(canonicalName: String): List<String> {
+        val normalized = normalizeLookupText(canonicalName)
+        val classes = mutableListOf<String>()
+        if (normalized in NSAID_CANONICALS) classes += "nsaid"
+        if (normalized in ANTICOAGULANT_ANTIPLATELET_CANONICALS) classes += "anticoagulant antiplatelet"
+        return classes
+    }
+
+    private fun tableExists(db: SQLiteDatabase, name: String): Boolean =
+        db.rawQuery(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ? LIMIT 1",
+            arrayOf(name),
+        ).use { it.moveToFirst() }
 
     private fun dedupeResolved(items: List<NormalizedMedication>): List<NormalizedMedication> {
         val seen = mutableSetOf<String>()
@@ -714,6 +977,97 @@ class SqliteSafetyRepository(
         val params: List<String>,
         val needsEffectJoin: Boolean,
     )
+
+    private data class AliasLookup(
+        val drugId: Long,
+        val canonicalName: String,
+        val alias: String,
+    )
+
+}
+
+private data class BrandIngredientEntry(
+    val brandName: String,
+    val ingredients: List<String>,
+)
+
+private val NSAID_CANONICALS = setOf(
+    "aceclofenac",
+    "aspirin",
+    "celecoxib",
+    "diclofenac",
+    "etoricoxib",
+    "ibuprofen",
+    "indomethacin",
+    "ketoprofen",
+    "ketorolac",
+    "meloxicam",
+    "naproxen",
+    "nimesulide",
+    "piroxicam",
+)
+
+private val ANTICOAGULANT_ANTIPLATELET_CANONICALS = setOf(
+    "apixaban",
+    "aspirin",
+    "clopidogrel",
+    "dabigatran",
+    "edoxaban",
+    "prasugrel",
+    "rivaroxaban",
+    "ticagrelor",
+    "warfarin",
+)
+
+private fun loadBrandIngredientMap(path: String): Map<String, BrandIngredientEntry> {
+    val file = File(path)
+    if (!file.exists()) return emptyMap()
+    return file.readLines()
+        .drop(1)
+        .mapNotNull { line ->
+            val columns = parseSimpleCsvLine(line)
+            val brandName = columns.getOrNull(0)?.trim().orEmpty()
+            val ingredients = columns.getOrNull(1)
+                ?.split("|")
+                ?.map { it.trim() }
+                ?.filter { it.isNotBlank() }
+                .orEmpty()
+            val normalizedBrand = normalizeLookupText(brandName)
+            if (normalizedBrand.isBlank() || ingredients.isEmpty()) {
+                null
+            } else {
+                normalizedBrand to BrandIngredientEntry(
+                    brandName = brandName,
+                    ingredients = ingredients,
+                )
+            }
+        }
+        .toMap()
+}
+
+private fun parseSimpleCsvLine(line: String): List<String> {
+    val columns = mutableListOf<String>()
+    val current = StringBuilder()
+    var inQuotes = false
+    var index = 0
+    while (index < line.length) {
+        val char = line[index]
+        when {
+            char == '"' && inQuotes && index + 1 < line.length && line[index + 1] == '"' -> {
+                current.append('"')
+                index += 1
+            }
+            char == '"' -> inQuotes = !inQuotes
+            char == ',' && !inQuotes -> {
+                columns += current.toString()
+                current.clear()
+            }
+            else -> current.append(char)
+        }
+        index += 1
+    }
+    columns += current.toString()
+    return columns
 }
 
 private fun Cursor.columnIndex(name: String): Int = getColumnIndexOrThrow(name)
