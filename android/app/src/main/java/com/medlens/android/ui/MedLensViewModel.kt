@@ -137,6 +137,7 @@ class MedLensViewModel(
         val orchestrator = AgentOrchestrator(
             dispatcher = ToolDispatcher(repo),
             provider = provider,
+            repository = repo,
         )
         val current = activeConversation() ?: return
         val assistantId = java.util.UUID.randomUUID().toString()
@@ -166,10 +167,13 @@ class MedLensViewModel(
                 )
                 if (updatedConversation != null) saveConversation(updatedConversation)
                 _uiState.update { it.copy(trace = result.trace, busy = false) }
-            }.onFailure {
+            }.onFailure { error ->
                 val active = activeConversation()
+                val failureText = turnFailureMessage(error)
                 val updatedConversation = active?.copy(
-                    messages = active.messages.filterNot { it.id == assistantId },
+                    messages = active.messages.map {
+                        if (it.id == assistantId) it.copy(content = failureText, pending = false) else it
+                    },
                     updatedAt = System.currentTimeMillis(),
                 )
                 if (updatedConversation != null) saveConversation(updatedConversation)
@@ -191,6 +195,7 @@ class MedLensViewModel(
         val orchestrator = AgentOrchestrator(
             dispatcher = ToolDispatcher(repo),
             provider = provider,
+            repository = repo,
         )
         val current = activeConversation() ?: return
         val displayText = userText.trim()
@@ -236,10 +241,13 @@ class MedLensViewModel(
                 )
                 if (updatedConversation != null) saveConversation(updatedConversation)
                 _uiState.update { it.copy(trace = result.trace, busy = false) }
-            }.onFailure {
+            }.onFailure { error ->
                 val active = activeConversation()
+                val failureText = imageTurnFailureMessage(error)
                 val updatedConversation = active?.copy(
-                    messages = active.messages.filterNot { it.id == assistantId },
+                    messages = active.messages.map {
+                        if (it.id == assistantId) it.copy(content = failureText, pending = false) else it
+                    },
                     updatedAt = System.currentTimeMillis(),
                 )
                 if (updatedConversation != null) saveConversation(updatedConversation)
@@ -322,17 +330,19 @@ class MedLensViewModel(
         candidates: List<String>,
         userText: String,
     ): String = buildString {
-        append("The user attached medicine image(s). Visible medicine candidates:\n")
+        append("The user attached one or more medicine images. The OCR/vision output below may contain text from multiple photos; treat it as one combined medicine list, not as separate conversations.\n")
+        append("Visible medicine candidates:\n")
         append(extracted.trim())
         if (candidates.isNotEmpty()) {
-            append("\n\nSeparate medication candidates to check. Treat each bullet as one product/name and call build_structured_report with exactly these medication_names before answering:\n")
+            append("\n\nMedication names to check together. Treat each bullet as one product/name from the combined images. Normalize these names, add only the resolved medicines, then call build_structured_report before answering:\n")
             candidates.forEach { candidate ->
                 append("- ")
                 append(candidate)
                 append("\n")
             }
         }
-        append("\n\nUse only deterministic local evidence to answer. Do not mention internal tools, extraction steps, or databases to the user.")
+        append("\n\nUse only deterministic local evidence to answer. Do not mention internal tools, extraction steps, databases, or that the user provided images unless they explicitly ask how the app read them.")
+        append("\nAnswer naturally as if the user typed the medicine names. Do not start with a preface like \"you provided an image\" or \"I see an image\".")
         if (userText.isBlank()) {
             append("\nUser intent: identify the visible medicines and check relevant medication safety concerns among them.")
         } else {
@@ -357,7 +367,7 @@ class MedLensViewModel(
         val candidates = linkedSetOf<String>()
         extracted
             .replace(Regex("(?i)\\bImage\\s+\\d+\\s*:"), "\n")
-            .split(Regex("[\\n;,]|\\s+and\\s+", RegexOption.IGNORE_CASE))
+            .split(Regex("[\\n;,]"))
             .map { raw ->
                 raw.trim()
                     .replace(Regex("^[-*•\\d.)\\s]+"), "")
@@ -385,6 +395,16 @@ class MedLensViewModel(
             .trim('-', ':')
             .trim()
         return simplified.takeIf { it.length >= 3 && !it.equals(value, ignoreCase = true) }
+    }
+
+    private fun turnFailureMessage(error: Throwable): String {
+        val detail = error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
+        return "I couldn't finish that turn — $detail. You can try rephrasing or asking again."
+    }
+
+    private fun imageTurnFailureMessage(error: Throwable): String {
+        val detail = error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
+        return "I couldn't read the attached image clearly enough to answer — $detail. Try a sharper photo, or type the medicine names directly."
     }
 
     private suspend fun hydrateSession(conversation: PersistedConversation?) {
