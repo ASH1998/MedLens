@@ -7,6 +7,8 @@ import com.medlens.core.data.SafetyRepository
 import com.medlens.core.data.model.NormalizedMedication
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.encodeToJsonElement
 import kotlin.system.measureTimeMillis
 
 val TOOL_SCHEMAS: List<ToolSchema> = listOf(
@@ -166,17 +168,67 @@ class ToolDispatcher(
     ): Map<String, String> = when (name) {
         "add_medications" -> {
             val names = decodeNames(args["names"])
-            session.medications.clear()
-            session.medications.addAll(store.normalizeMedications(names))
-            mapOf("json" to json.encodeToString(session.medications))
+            val normalized = store.normalizeMedications(names)
+            val existingInputs = session.medications.map { it.input_name.lowercase() }.toMutableSet()
+            val existingCanonicals = session.medications.mapNotNull { it.canonical_name }.toMutableSet()
+            val added = mutableListOf<com.medlens.core.data.model.NormalizedMedication>()
+            val alreadyPresent = mutableListOf<com.medlens.core.data.model.NormalizedMedication>()
+            val unresolved = mutableListOf<com.medlens.core.data.model.NormalizedMedication>()
+            for (item in normalized) {
+                val inputKey = item.input_name.lowercase()
+                val canonicalKey = item.canonical_name
+                val duplicate = inputKey in existingInputs ||
+                    (canonicalKey != null && canonicalKey in existingCanonicals)
+                if (duplicate) {
+                    alreadyPresent += item
+                    continue
+                }
+                session.medications.add(item)
+                existingInputs += inputKey
+                if (canonicalKey != null) existingCanonicals += canonicalKey
+                if (item.resolved) added += item else unresolved += item
+            }
+            session.lastReport = null
+            mapOf(
+                "json" to buildJsonObject {
+                    put("added", json.encodeToJsonElement(added))
+                    put("already_present", json.encodeToJsonElement(alreadyPresent))
+                    put("unresolved", json.encodeToJsonElement(unresolved))
+                }.toString(),
+            )
         }
         "remove_medications" -> {
-            val names = decodeNames(args["names"]).map { it.lowercase() }.toSet()
-            session.medications.removeAll { it.input_name.lowercase() in names }
-            mapOf("json" to json.encodeToString(session.medications))
+            val names = decodeNames(args["names"])
+            val normalized = store.normalizeMedications(names)
+            val removeInputs = normalized.map { it.input_name.lowercase() }.toSet()
+            val removeCanonicals = normalized.mapNotNull { it.canonical_name }.toSet()
+            val removed = mutableListOf<com.medlens.core.data.model.NormalizedMedication>()
+            val iterator = session.medications.iterator()
+            while (iterator.hasNext()) {
+                val item = iterator.next()
+                val match = item.input_name.lowercase() in removeInputs ||
+                    (item.canonical_name != null && item.canonical_name in removeCanonicals)
+                if (match) {
+                    removed += item
+                    iterator.remove()
+                }
+            }
+            val removedInputs = removed.map { it.input_name.lowercase() }.toSet()
+            val removedCanonicals = removed.mapNotNull { it.canonical_name }.toSet()
+            val notFound = normalized
+                .filter { it.input_name.lowercase() !in removedInputs && (it.canonical_name == null || it.canonical_name !in removedCanonicals) }
+                .map { it.input_name }
+            session.lastReport = null
+            mapOf(
+                "json" to buildJsonObject {
+                    put("removed", json.encodeToJsonElement(removed))
+                    put("not_found", json.encodeToJsonElement(notFound))
+                }.toString(),
+            )
         }
         "clear_medications" -> {
             session.medications.clear()
+            session.lastReport = null
             mapOf("text" to "Cleared the current medication list.")
         }
         "list_medications" -> mapOf("json" to json.encodeToString(session.medicationInputs()))
