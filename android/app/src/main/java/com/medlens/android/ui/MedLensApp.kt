@@ -151,6 +151,7 @@ private fun ChatShell(
     var pendingImagePaths by rememberSaveable { mutableStateOf(emptyList<String>()) }
     var settingsOpen by remember { mutableStateOf(false) }
     var cameraOpen by rememberSaveable { mutableStateOf(false) }
+    val uriHandler = LocalUriHandler.current
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val compact = maxWidth < 720.dp
@@ -364,6 +365,23 @@ private fun ChatShell(
                             onClick = { viewModel.setBackendPref(LiteRtBackendPref.GPU) },
                         )
                         Text("GPU")
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            "Built by",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            "Ashutosh Mishra",
+                            modifier = Modifier.clickable { uriHandler.openUri("https://ashutoshmishra.dev/") },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MedLensTeal,
+                            fontWeight = FontWeight.SemiBold,
+                        )
                     }
                     Spacer(modifier = Modifier.height(12.dp))
                 }

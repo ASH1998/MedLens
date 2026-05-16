@@ -1,5 +1,6 @@
 package com.medlens.core.agent
 
+import android.util.Log as AndroidLog
 import com.medlens.core.agent.model.ChatSession
 import com.medlens.core.agent.model.ToolCallRecord
 import com.medlens.core.agent.model.ToolSchema
@@ -139,6 +140,7 @@ class ToolDispatcher(
         args: Map<String, String>,
         session: ChatSession,
     ): Map<String, String> {
+        ToolLog.d("MedLens", "ToolDispatcher.dispatch BEGIN name=$name args=$args")
         var result = emptyMap<String, String>()
         var error: String? = null
         val duration = measureTimeMillis {
@@ -146,6 +148,7 @@ class ToolDispatcher(
                 result = dispatchInner(name, args, session)
             } catch (t: Throwable) {
                 error = t.message ?: t::class.java.simpleName
+                ToolLog.e("MedLens", "ToolDispatcher.dispatch threw for $name: $error", t)
             }
         }
         session.lastTrace += ToolCallRecord(
@@ -156,8 +159,11 @@ class ToolDispatcher(
             duration_ms = duration,
         )
         if (error != null) {
+            ToolLog.w("MedLens", "ToolDispatcher.dispatch END name=$name error=$error duration_ms=$duration")
             return mapOf("error" to error.orEmpty())
         }
+        val payload = result["json"] ?: result["text"] ?: ""
+        ToolLog.d("MedLens", "ToolDispatcher.dispatch END name=$name duration_ms=$duration payload_chars=${payload.length}")
         return result
     }
 
@@ -319,4 +325,18 @@ fun syncSessionMedications(
 ) {
     session.medications.clear()
     session.medications.addAll(normalized)
+}
+
+private object ToolLog {
+    fun d(tag: String, message: String) {
+        runCatching { AndroidLog.d(tag, message) }
+    }
+
+    fun w(tag: String, message: String) {
+        runCatching { AndroidLog.w(tag, message) }
+    }
+
+    fun e(tag: String, message: String, throwable: Throwable) {
+        runCatching { AndroidLog.e(tag, message, throwable) }
+    }
 }

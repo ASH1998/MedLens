@@ -12,24 +12,13 @@ import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.ExperimentalApi
 import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.Message
-import com.google.ai.edge.litertlm.OpenApiTool
-import com.google.ai.edge.litertlm.Role
-import com.google.ai.edge.litertlm.tool
 import com.medlens.core.agent.model.AgentMessage
 import com.medlens.core.agent.model.NativeToolProvider
-import com.medlens.core.agent.model.ToolCall
-import com.medlens.core.agent.model.ToolModelResponse
-import com.medlens.core.agent.model.ToolResultPayload
-import com.medlens.core.agent.model.ToolSchema
 import com.medlens.core.agent.model.TurnSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
 
 enum class LiteRtBackendChoice { CPU, GPU }
 
@@ -47,11 +36,14 @@ class LiteRtLmProvider(
     override suspend fun startTurn(
         systemPrompt: String,
         priorTranscript: List<AgentMessage>,
-        tools: List<ToolSchema>,
     ): TurnSession = withContext(Dispatchers.IO) {
+        Log.i(TAG, "startTurn: waiting for turnMutex")
         turnMutex.lock()
+        Log.i(TAG, "startTurn: acquired turnMutex")
         try {
+            val engineStart = System.currentTimeMillis()
             val activeEngine = engineMutex.withLock { engine ?: createEngine().also { engine = it } }
+            Log.i(TAG, "startTurn: engine ready (acquire/create took ${System.currentTimeMillis() - engineStart}ms)")
             val initialMessages = priorTranscript.mapNotNull { msg ->
                 when (msg.role) {
                     "user" -> Message.user(msg.content)
@@ -59,16 +51,22 @@ class LiteRtLmProvider(
                     else -> null
                 }
             }
+            Log.i(TAG, "startTurn: creating conversation (system=${systemPrompt.length} chars, ${initialMessages.size} prior msgs, backend=$backendChoice)")
+            val convStart = System.currentTimeMillis()
             val conversation = activeEngine.createConversation(
                 ConversationConfig(
                     systemInstruction = Contents.of(systemPrompt),
                     initialMessages = initialMessages,
-                    tools = tools.map { tool(MedLensOpenApiTool(it)) },
                     automaticToolCalling = false,
                 ),
             )
-            LiteRtTurnSession(conversation) { turnMutex.unlock() }
+            Log.i(TAG, "startTurn: conversation created in ${System.currentTimeMillis() - convStart}ms")
+            LiteRtTurnSession(conversation) {
+                Log.i(TAG, "TurnSession.close: releasing turnMutex")
+                turnMutex.unlock()
+            }
         } catch (t: Throwable) {
+            Log.e(TAG, "startTurn FAILED: ${t::class.java.simpleName}: ${t.message}", t)
             if (turnMutex.isLocked) turnMutex.unlock()
             throw t
         }
@@ -78,6 +76,7 @@ class LiteRtLmProvider(
         imagePath: String,
         userText: String,
     ): String = withContext(Dispatchers.IO) {
+        Log.i(TAG, "extractMedicineCandidatesFromImage: $imagePath")
         turnMutex.withLock {
             val activeEngine = engineMutex.withLock { engine ?: createEngine().also { engine = it } }
             val conversation = activeEngine.createConversation(
@@ -86,6 +85,7 @@ class LiteRtLmProvider(
                     automaticToolCalling = false,
                 ),
             )
+            val ocrStart = System.currentTimeMillis()
             conversation.use {
                 val response = it.sendMessage(
                     Contents.of(
@@ -94,7 +94,9 @@ class LiteRtLmProvider(
                     ),
                     emptyMap(),
                 )
-                extractText(response)
+                val extracted = extractText(response)
+                Log.i(TAG, "image OCR done in ${System.currentTimeMillis() - ocrStart}ms (${extracted.length} chars):\n${extracted.take(500)}")
+                extracted
             }
         }
     }
@@ -105,6 +107,8 @@ class LiteRtLmProvider(
     }
 
     private fun createEngine(): Engine {
+        Log.i(TAG, "createEngine: modelPath=$modelPath backend=$backendChoice")
+        val initStart = System.currentTimeMillis()
         enableSpeculativeDecoding()
         val backend = when (backendChoice) {
             LiteRtBackendChoice.GPU -> Backend.GPU()
@@ -118,9 +122,15 @@ class LiteRtLmProvider(
                 maxNumImages = 1,
                 cacheDir = context.cacheDir.path,
             )
-            Engine(config).also { it.initialize() }
+            Engine(config).also {
+                it.initialize()
+                Log.i(TAG, "createEngine: initialized $backendChoice engine in ${System.currentTimeMillis() - initStart}ms")
+            }
         }.getOrElse { error ->
-            if (backendChoice != LiteRtBackendChoice.GPU) throw error
+            if (backendChoice != LiteRtBackendChoice.GPU) {
+                Log.e(TAG, "createEngine FAILED on $backendChoice: ${error.message}", error)
+                throw error
+            }
             Log.w(TAG, "GPU LiteRT backend failed; retrying this model session on CPU.", error)
             val cpuConfig = EngineConfig(
                 modelPath = modelPath,
@@ -129,7 +139,10 @@ class LiteRtLmProvider(
                 maxNumImages = 1,
                 cacheDir = context.cacheDir.path,
             )
-            Engine(cpuConfig).also { it.initialize() }
+            Engine(cpuConfig).also {
+                it.initialize()
+                Log.i(TAG, "createEngine: fell back to CPU and initialized in ${System.currentTimeMillis() - initStart}ms")
+            }
         }
     }
 }
@@ -138,42 +151,32 @@ private class LiteRtTurnSession(
     private val conversation: Conversation,
     private val releaseTurnLock: () -> Unit,
 ) : TurnSession {
-    private var roundCounter = 0
     private var closed = false
+    private var sendCounter = 0
 
-    override suspend fun sendUser(content: String): ToolModelResponse = withContext(Dispatchers.IO) {
-        val message = Message.user(content)
-        toModelResponse(conversation.sendMessage(message, emptyMap()))
-    }
-
-    override suspend fun sendToolResults(results: List<ToolResultPayload>): ToolModelResponse = withContext(Dispatchers.IO) {
-        val contents = if (results.isEmpty()) {
-            Contents.of("")
-        } else {
-            Contents.of(*results.map { Content.ToolResponse(it.name, it.content) }.toTypedArray())
+    override suspend fun sendMessage(content: String): String = withContext(Dispatchers.IO) {
+        sendCounter += 1
+        val sendId = sendCounter
+        Log.i("MedLens", "LiteRT sendMessage #$sendId BEGIN (${content.length} chars)")
+        val start = System.currentTimeMillis()
+        try {
+            val message = Message.user(content)
+            val reply = conversation.sendMessage(message, emptyMap())
+            val text = extractText(reply)
+            Log.i("MedLens", "LiteRT sendMessage #$sendId END in ${System.currentTimeMillis() - start}ms (${text.length} chars out)")
+            text
+        } catch (t: Throwable) {
+            Log.e("MedLens", "LiteRT sendMessage #$sendId THREW after ${System.currentTimeMillis() - start}ms: ${t::class.java.simpleName}: ${t.message}", t)
+            throw t
         }
-        val message = Message.tool(contents)
-        toModelResponse(conversation.sendMessage(message, emptyMap()))
     }
 
     override fun close() {
         if (closed) return
         closed = true
+        Log.i("MedLens", "LiteRtTurnSession.close")
         runCatching { conversation.close() }
         releaseTurnLock()
-    }
-
-    private fun toModelResponse(reply: Message): ToolModelResponse {
-        val text = extractText(reply)
-        val round = roundCounter++
-        val mappedCalls = reply.toolCalls.mapIndexed { index, call ->
-            ToolCall(
-                id = "litert-r$round-$index",
-                name = call.name,
-                args = call.arguments.mapValues { (_, value) -> encodeToolArgument(value) },
-            )
-        }
-        return ToolModelResponse(text = text, tool_calls = mappedCalls)
     }
 }
 
@@ -183,25 +186,7 @@ private fun extractText(message: Message): String =
         .joinToString("") { it.text }
         .trim()
 
-private fun encodeToolArgument(value: Any?): String = when (value) {
-    null -> ""
-    is String -> value
-    is Number, is Boolean -> value.toString()
-    is List<*> -> buildJsonArray {
-        value.forEach { add(JsonPrimitive(it?.toString().orEmpty())) }
-    }.toString()
-    is Array<*> -> buildJsonArray {
-        value.forEach { add(JsonPrimitive(it?.toString().orEmpty())) }
-    }.toString()
-    is Map<*, *> -> buildJsonObject {
-        value.forEach { (key, item) ->
-            put(key.toString(), JsonPrimitive(item?.toString().orEmpty()))
-        }
-    }.toString()
-    else -> value.toString()
-}
-
-private const val TAG = "LiteRtLmProvider"
+private const val TAG = "MedLens"
 private const val IMAGE_EXTRACTION_SYSTEM_PROMPT = """
 You extract medication names from images for MedLens.
 
@@ -224,19 +209,4 @@ private fun imageExtractionUserPrompt(userText: String): String = buildString {
 private fun enableSpeculativeDecoding() {
     runCatching { ExperimentalFlags.enableSpeculativeDecoding = true }
         .onFailure { Log.w(TAG, "Speculative decoding flag not applied: ${it.message}") }
-}
-
-private class MedLensOpenApiTool(
-    private val schema: ToolSchema,
-) : OpenApiTool {
-    override fun getToolDescriptionJsonString(): String {
-        return buildJsonObject {
-            put("name", JsonPrimitive(schema.name))
-            put("description", JsonPrimitive(schema.description))
-            put("parameters", Json.parseToJsonElement(schema.inputSchemaJson))
-        }.toString()
-    }
-
-    override fun execute(paramsJsonString: String): String =
-        "{\"error\":\"MedLens executes tools manually in the Android agent loop.\"}"
 }
