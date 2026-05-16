@@ -1,5 +1,27 @@
 # Android Changelog
 
+## v1.1.0 - 2026-05-16
+
+- Updated Android package metadata to `versionCode = 110` and
+  `versionName = "v1.1.0"`.
+- Reworked the Android LiteRT agent loop to avoid native tool-call parse
+  failures by using a plain `CALL` / `ASK` / `ANSWER` protocol.
+- Improved multi-image medicine checks so extracted names and typed medicine
+  names are checked together.
+- Added protection against asking for active ingredients after the structured
+  report already resolved them.
+- Included normalized active ingredients in compact structured-report tool
+  results.
+- Increased the default tool loop budget to 5 rounds and the turn timeout to 2
+  minutes.
+- Tuned patient-facing answers to use warmer language and light bold formatting
+  such as `**Bottom line:**`, `**Why:**`, and `**Watch for:**`.
+- Added a subtle Settings credit link for `Ashutosh Mishra`.
+- For combinations with no flagged local finding, answers now provide cautious
+  general medication guidance instead of leading with a database-style no-finding
+  sentence.
+- Rebuilt the debug APK from the Android Gradle project for release testing.
+
 ## v1.0.0 - 2026-05-16
 
 - Updated Android package metadata to `versionCode = 100` and
