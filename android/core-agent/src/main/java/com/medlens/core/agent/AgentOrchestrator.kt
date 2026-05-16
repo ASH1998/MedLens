@@ -1,25 +1,30 @@
 package com.medlens.core.agent
 
+import android.util.Log as AndroidLog
 import com.medlens.core.agent.model.AgentMessage
 import com.medlens.core.agent.model.AgentTurnResult
 import com.medlens.core.agent.model.ChatSession
 import com.medlens.core.agent.model.NativeToolProvider
-import com.medlens.core.agent.model.ToolResultPayload
 import com.medlens.core.data.SafetyRepository
-import com.medlens.core.data.model.KnownInteraction
 import com.medlens.core.data.model.MedicationSafetyReport
 import com.medlens.core.data.model.NormalizedMedication
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+
+private const val DEFAULT_MAX_TOOL_ROUNDS = 5
+private const val DEFAULT_TURN_TIME_BUDGET_MILLIS = 120_000L
 
 class AgentOrchestrator(
     private val dispatcher: ToolDispatcher,
@@ -33,70 +38,71 @@ class AgentOrchestrator(
         userMessage: String,
         audiencePrompt: String? = null,
         effectLimit: Int = 5,
-        maxRounds: Int = 6,
-        maxToolCallsPerRound: Int = 4,
-        timeBudgetMillis: Long = 30_000L,
+        maxRounds: Int = DEFAULT_MAX_TOOL_ROUNDS,
+        timeBudgetMillis: Long = DEFAULT_TURN_TIME_BUDGET_MILLIS,
     ): AgentTurnResult {
+        val turnStart = System.currentTimeMillis()
+        Log.i(TAG, "==== runTurn START ====")
+        Log.i(TAG, "userMessage (${userMessage.length} chars): ${userMessage.take(300)}")
+        Log.i(TAG, "audiencePrompt: ${audiencePrompt?.take(80) ?: "<none>"}")
+        Log.i(TAG, "effectLimit=$effectLimit maxRounds=$maxRounds timeBudgetMs=$timeBudgetMillis")
+        Log.i(TAG, "prior session: ${session.medications.size} meds, ${session.transcript.size} transcript msgs, lastReport=${session.lastReport != null}")
+
         session.clearTurnTrace()
         val priorTranscript = textTranscript(session.transcript)
         val systemPrompt = audiencePrompt?.let { "$TOOL_LOOP_SYSTEM_PROMPT\n\nAudience style:\n$it" }
             ?: TOOL_LOOP_SYSTEM_PROMPT
+        Log.i(TAG, "systemPrompt size=${systemPrompt.length} chars; priorTranscript truncated to ${priorTranscript.size} msgs")
 
-        val activeProvider = provider ?: throw IllegalStateException("Gemma is not ready yet.")
-        val currentTurnReport = precheckCurrentTurnReport(session, userMessage, effectLimit)
+        val activeProvider = provider ?: run {
+            Log.e(TAG, "no provider configured — throwing")
+            throw IllegalStateException("Gemma is not ready yet.")
+        }
+        Log.i(TAG, "provider=${activeProvider.name}")
+
+        val currentTurnReport = runCatching {
+            precheckCurrentTurnReport(session, userMessage, effectLimit)
+        }.onFailure { Log.w(TAG, "precheck failed: ${it.message}", it) }.getOrNull()
+        if (currentTurnReport != null) {
+            Log.i(TAG, "precheck report: severity=${currentTurnReport.overall_severity} findings=${currentTurnReport.findings.size} resolved=${currentTurnReport.normalized_medications.count { it.resolved }} unresolved=${currentTurnReport.unresolved_medications.size}")
+        } else {
+            Log.i(TAG, "precheck: no report (no explicit pair detected or no repository)")
+        }
 
         var finalText = ""
-        var fallbackUsed = false
-
         try {
             withTimeout(timeBudgetMillis) {
-                activeProvider.startTurn(systemPrompt, priorTranscript, TOOL_SCHEMAS).use { turnSession ->
-                    val firstUserContent = userContent(userMessage, session.medicationInputs())
-                    var response = turnSession.sendUser(firstUserContent)
-                    var roundsRemaining = maxRounds
-
-                    while (true) {
-                        if (response.tool_calls.isEmpty()) {
-                            finalText = response.text.trim()
-                            break
-                        }
-                        if (roundsRemaining <= 0) {
-                            fallbackUsed = true
-                            break
-                        }
-                        roundsRemaining -= 1
-
-                        val limited = response.tool_calls.take(maxToolCallsPerRound)
-                        val payloads = mutableListOf<ToolResultPayload>()
-                        for (call in limited) {
-                            val args = call.args.toMutableMap()
-                            if (call.name == "build_structured_report" && !args.containsKey("limit")) {
-                                args["limit"] = effectLimit.toString()
-                            }
-                            val result = dispatcher.dispatch(call.name, args, session)
-                            val rawContent = result["json"] ?: result["text"] ?: result["error"].orEmpty()
-                            payloads += ToolResultPayload(
-                                name = call.name,
-                                content = compactToolContent(call.name, rawContent),
-                            )
-                        }
-                        response = turnSession.sendToolResults(payloads)
-                    }
+                Log.i(TAG, "startTurn — opening LiteRT conversation")
+                activeProvider.startTurn(systemPrompt, priorTranscript).use { turnSession ->
+                    Log.i(TAG, "startTurn — conversation opened, entering protocol loop")
+                    finalText = runProtocolLoop(
+                        turnSession = turnSession,
+                        session = session,
+                        userMessage = userMessage,
+                        currentTurnReport = currentTurnReport,
+                        effectLimit = effectLimit,
+                        maxRounds = maxRounds,
+                    )
                 }
+                Log.i(TAG, "startTurn — conversation closed")
             }
-        } catch (timeout: TimeoutCancellationException) {
-            fallbackUsed = true
+        } catch (t: TimeoutCancellationException) {
+            Log.w(TAG, "runTurn TIMEOUT after ${System.currentTimeMillis() - turnStart}ms (budget=${timeBudgetMillis}ms)")
+            finalText = ""
+        } catch (t: Throwable) {
+            Log.e(TAG, "runTurn threw ${t::class.java.simpleName}: ${t.message}", t)
+            finalText = ""
         }
 
-        if (fallbackUsed || finalText.isBlank()) {
-            finalText = buildDeterministicFallback(session, effectLimit)
-            fallbackUsed = true
+        if (finalText.isBlank()) {
+            Log.w(TAG, "finalText is blank — using HARD_FAILURE_MESSAGE")
+            finalText = HARD_FAILURE_MESSAGE
+        } else {
+            Log.i(TAG, "finalText OK (${finalText.length} chars): ${finalText.take(200)}")
         }
-        val reportForVerification = currentTurnReport ?: session.lastReport
-        finalText = verifiedFinalText(finalText, reportForVerification)
-        if (currentTurnReport != null) {
-            session.lastReport = currentTurnReport
-        }
+        Log.i(TAG, "==== runTurn END (${System.currentTimeMillis() - turnStart}ms total) ====")
+
+        val reportForResult = currentTurnReport ?: session.lastReport
 
         session.transcript.clear()
         session.transcript += priorTranscript
@@ -106,10 +112,220 @@ class AgentOrchestrator(
         return AgentTurnResult(
             finalText = finalText,
             trace = session.lastTrace.toList(),
-            report = reportForVerification,
+            report = reportForResult,
             usedTools = session.lastTrace.map { it.name },
             providerName = activeProvider.name,
         )
+    }
+
+    private suspend fun runProtocolLoop(
+        turnSession: com.medlens.core.agent.model.TurnSession,
+        session: ChatSession,
+        userMessage: String,
+        currentTurnReport: MedicationSafetyReport?,
+        effectLimit: Int,
+        maxRounds: Int,
+    ): String {
+        val initialMessage = composeInitialUserMessage(
+            userMessage = userMessage,
+            session = session,
+            seededReport = currentTurnReport,
+        )
+        Log.i(TAG, "initial LLM message (${initialMessage.length} chars):\n${initialMessage.take(800)}")
+        var nextMessage = initialMessage
+        var roundsRemaining = maxRounds
+        var round = 0
+
+        while (roundsRemaining > 0) {
+            roundsRemaining -= 1
+            round += 1
+            Log.i(TAG, "---- round $round: sending to LLM (${nextMessage.length} chars) ----")
+            val roundStart = System.currentTimeMillis()
+            val reply = runCatching { turnSession.sendMessage(nextMessage) }
+                .onFailure { Log.e(TAG, "round $round sendMessage failed: ${it::class.java.simpleName}: ${it.message}", it) }
+                .getOrNull()
+                .orEmpty()
+            Log.i(TAG, "round $round LLM reply (${reply.length} chars, took ${System.currentTimeMillis() - roundStart}ms):\n${reply.take(800)}")
+            val parsed = parseProtocol(reply)
+            Log.i(TAG, "round $round parsed as: ${parsed::class.java.simpleName}")
+            when (parsed) {
+                is ProtocolReply.Answer -> {
+                    Log.i(TAG, "round $round -> ANSWER (${parsed.text.length} chars)")
+                    return parsed.text
+                }
+                is ProtocolReply.Ask -> {
+                    Log.i(TAG, "round $round -> ASK: ${parsed.text}")
+                    val report = session.lastReport ?: currentTurnReport
+                    if (shouldSuppressReportClarification(parsed.text, report)) {
+                        Log.w(TAG, "round $round ASK requested data already present in report; forcing final ANSWER")
+                        return forceAnswerFromReport(turnSession, report!!, parsed.text)
+                    }
+                    return parsed.text
+                }
+                is ProtocolReply.Calls -> {
+                    Log.i(TAG, "round $round -> CALLS: ${parsed.calls.joinToString { "${it.name}(${it.args})" }}")
+                    val toolResult = dispatchCalls(parsed.calls, session, effectLimit)
+                    nextMessage = formatToolResultMessage(parsed.calls, toolResult)
+                    Log.i(TAG, "round $round next message (${nextMessage.length} chars):\n${nextMessage.take(800)}")
+                }
+                is ProtocolReply.Unstructured -> {
+                    val report = session.lastReport ?: currentTurnReport
+                    if (shouldSuppressReportClarification(parsed.text, report)) {
+                        Log.w(TAG, "round $round unstructured reply requested data already present in report; forcing final ANSWER")
+                        return forceAnswerFromReport(turnSession, report!!, parsed.text)
+                    }
+                    Log.w(TAG, "round $round -> UNSTRUCTURED (no verb detected). Using raw text as answer.")
+                    return parsed.text
+                }
+            }
+        }
+
+        Log.w(TAG, "loop exhausted after $round rounds — sending wrap-up to model")
+        val wrapUp = buildString {
+            append("You have used your tool budget for this turn.\n")
+            append("Reply now with one ANSWER: <pharmacist reply> based on what you already learned. ")
+            append("Do not emit another CALL.")
+        }
+        val wrapStart = System.currentTimeMillis()
+        val finalReply = runCatching { turnSession.sendMessage(wrapUp) }
+            .onFailure { Log.e(TAG, "wrap-up sendMessage failed: ${it::class.java.simpleName}: ${it.message}", it) }
+            .getOrNull()
+            .orEmpty()
+        Log.i(TAG, "wrap-up reply (${finalReply.length} chars, took ${System.currentTimeMillis() - wrapStart}ms):\n${finalReply.take(800)}")
+        return when (val parsed = parseProtocol(finalReply)) {
+            is ProtocolReply.Answer -> {
+                Log.i(TAG, "wrap-up -> ANSWER")
+                parsed.text
+            }
+            is ProtocolReply.Ask -> {
+                Log.i(TAG, "wrap-up -> ASK")
+                val report = session.lastReport ?: currentTurnReport
+                if (shouldSuppressReportClarification(parsed.text, report)) {
+                    Log.w(TAG, "wrap-up ASK requested data already present in report; using report fallback")
+                    return reportFallbackText(report!!)
+                }
+                parsed.text
+            }
+            is ProtocolReply.Unstructured -> {
+                Log.w(TAG, "wrap-up -> UNSTRUCTURED, using raw text")
+                parsed.text
+            }
+            is ProtocolReply.Calls -> {
+                Log.e(TAG, "wrap-up STILL emitted CALL — giving up on this turn")
+                ""
+            }
+        }
+    }
+
+    private suspend fun forceAnswerFromReport(
+        turnSession: com.medlens.core.agent.model.TurnSession,
+        report: MedicationSafetyReport,
+        rejectedQuestion: String,
+    ): String {
+        val prompt = buildString {
+            append("Do not ask that clarification question. It is already answered by the structured report.\n")
+            append("Rejected question: ")
+            append(rejectedQuestion)
+            append("\n\nStructured report to use:\n")
+            append(compactStructuredReport(json.encodeToString(MedicationSafetyReport.serializer(), report)))
+            append("\n\nReply now with ANSWER: <pharmacist reply> only. ")
+            append("Use the normalized/canonical medicines from normalized_medications as the active ingredients. ")
+            append("If some raw product names are unresolved, mention only those as not checked; do not ask for active ingredients for resolved medicines.")
+            append(" Keep it human: use **Bottom line:**, brief reason, no row counts, no report-like wording.")
+        }
+        val reply = runCatching { turnSession.sendMessage(prompt) }
+            .onFailure { Log.e(TAG, "force-answer sendMessage failed: ${it::class.java.simpleName}: ${it.message}", it) }
+            .getOrNull()
+            .orEmpty()
+        Log.i(TAG, "force-answer reply (${reply.length} chars):\n${reply.take(800)}")
+        return when (val parsed = parseProtocol(reply)) {
+            is ProtocolReply.Answer -> parsed.text
+            is ProtocolReply.Unstructured -> parsed.text.ifBlank { reportFallbackText(report) }
+            is ProtocolReply.Ask,
+            is ProtocolReply.Calls -> reportFallbackText(report)
+        }
+    }
+
+    private suspend fun dispatchCalls(
+        calls: List<ParsedCall>,
+        session: ChatSession,
+        effectLimit: Int,
+    ): List<Pair<ParsedCall, String>> {
+        val results = mutableListOf<Pair<ParsedCall, String>>()
+        for ((index, call) in calls.withIndex()) {
+            val args = call.args.toMutableMap()
+            if (call.name == "build_structured_report" && !args.containsKey("limit")) {
+                args["limit"] = effectLimit.toString()
+            }
+            Log.i(TAG, "TOOL [${index + 1}/${calls.size}] dispatch: ${call.name} args=$args")
+            val toolStart = System.currentTimeMillis()
+            val dispatched = dispatcher.dispatch(call.name, args, session)
+            val toolMs = System.currentTimeMillis() - toolStart
+            val rawContent = dispatched["json"] ?: dispatched["text"] ?: dispatched["error"].orEmpty()
+            val hasError = dispatched.containsKey("error")
+            if (hasError) {
+                Log.w(TAG, "TOOL ${call.name} returned error in ${toolMs}ms: ${dispatched["error"]}")
+            } else {
+                Log.i(TAG, "TOOL ${call.name} OK in ${toolMs}ms, raw ${rawContent.length} chars: ${rawContent.take(300)}")
+            }
+            val compact = compactToolContent(call.name, rawContent)
+            Log.i(TAG, "TOOL ${call.name} compacted to ${compact.length} chars: ${compact.take(300)}")
+            results += call to compact
+        }
+        return results
+    }
+
+    private fun formatToolResultMessage(
+        calls: List<ParsedCall>,
+        results: List<Pair<ParsedCall, String>>,
+    ): String = buildString {
+        append("TOOL_RESULT")
+        if (results.size == 1) {
+            val (call, content) = results.first()
+            append(" for ").append(call.name).append(":\n")
+            append(content)
+        } else {
+            append(":\n")
+            results.forEachIndexed { index, (call, content) ->
+                append("\n[").append(index + 1).append("] ").append(call.name).append("\n")
+                append(content)
+                append("\n")
+            }
+        }
+        append("\n\nNow reply with CALL: ..., ASK: ..., or ANSWER: ...")
+        if (calls.any { it.name == "build_structured_report" }) {
+            append("\nFor build_structured_report, normalized_medications already contains the active ingredients/canonical names. Do not ASK for active ingredients for resolved medicines; ANSWER using the report.")
+            append("\nWrite the ANSWER like a pharmacist talking to a patient: practical first sentence, brief reason, no row counts, no report-like wording.")
+            append("\nUse light markdown emphasis that the app can render: **Bottom line:**, **Why:**, **Watch for:**, and bold the severity only when it matters.")
+            append("\nFor no flagged local finding, do not lead with \"I don't see\" or \"I did not find\". Give a practical general-medication answer from your clinical knowledge, with **Bottom line:** and **Watch for:**. Do not invent a flagged interaction, severity, or source.")
+            append("\nFor Major findings, start with **Bottom line:**, say you would be careful with this pair, bold **Major**, explain the concern plainly, then include Sources only if URLs were returned.")
+        }
+    }
+
+    private fun composeInitialUserMessage(
+        userMessage: String,
+        session: ChatSession,
+        seededReport: MedicationSafetyReport?,
+    ): String = buildString {
+        append(userMessage)
+        val current = session.medicationInputs()
+        if (current.isNotEmpty()) {
+            append("\n\nSession medications already on file: ")
+            append(current.joinToString(", "))
+        }
+        if (seededReport != null) {
+            // Hint the model that the names are pre-canonicalized; it can skip normalize and go
+            // straight to build_structured_report. We do NOT paste the full report into the
+            // prompt — that bloats Gemma 3n's context. Let the tool call return it.
+            val canonical = seededReport.normalized_medications.filter { it.resolved }
+                .mapNotNull { it.canonical_name }
+                .distinct()
+            if (canonical.isNotEmpty()) {
+                append("\n\nPre-resolved canonical names for this question: ")
+                append(canonical.joinToString(", "))
+                append("\nGo straight to CALL: build_structured_report with these names.")
+            }
+        }
     }
 
     private suspend fun precheckCurrentTurnReport(
@@ -141,50 +357,9 @@ class AgentOrchestrator(
         }
     }
 
-    private suspend fun buildDeterministicFallback(session: ChatSession, effectLimit: Int): String {
-        val repo = repository
-        val report = if (repo != null) {
-            runCatching { repo.buildStructuredReport(session.medicationInputs(), effectLimit = effectLimit) }
-                .onSuccess { session.lastReport = it }
-                .getOrNull()
-        } else {
-            session.lastReport
-        }
-        return if (report != null) {
-            deterministicTextFromReport(report)
-        } else {
-            "I could not finish that turn and I do not have a local report to fall back on. Please try again."
-        }
-    }
-
-    private fun verifiedFinalText(modelText: String, report: MedicationSafetyReport?): String {
-        if (report == null) return modelText
-        val lower = modelText.lowercase()
-        val contradictsFinding = listOf(
-            "did not find a flagged interaction",
-            "didn't find a flagged interaction",
-            "no flagged interaction",
-            "not find any flagged interaction",
-            "no specific flagged interaction",
-            "no known interaction",
-        ).any { it in lower }
-        val omitsDuplicateWarning = report.duplicate_ingredient_warnings.isNotEmpty() &&
-            report.duplicate_ingredient_warnings.none { warning -> warning.ingredient.lowercase() in lower }
-        return if ((report.findings.isNotEmpty() && contradictsFinding) || omitsDuplicateWarning) {
-            deterministicTextFromReport(report)
-        } else {
-            modelText
-        }
-    }
-
     private fun textTranscript(messages: List<AgentMessage>): List<AgentMessage> =
         messages.filter { it.role == "user" || it.role == "assistant" }
             .takeLast(12)
-
-    private fun userContent(message: String, current: List<String>): String = buildString {
-        append(message)
-        if (current.isNotEmpty()) append("\n\nCurrent session medications: ${current.joinToString(", ")}")
-    }
 
     private fun compactToolContent(toolName: String, content: String): String {
         val compact = when (toolName) {
@@ -204,6 +379,10 @@ class AgentOrchestrator(
             JsonObject.serializer(),
             buildJsonObject {
                 copy(root, "input_medications")
+                put(
+                    "normalized_medications",
+                    compactNormalizedArray(root["normalized_medications"], limit = 10),
+                )
                 copy(root, "checked_pair_count")
                 copy(root, "overall_severity")
                 copy(root, "evidence_status")
@@ -347,8 +526,150 @@ class AgentOrchestrator(
     private fun String.limitForModel(): String =
         if (length <= TOOL_RESULT_CHAR_LIMIT) this else take(TOOL_RESULT_CHAR_LIMIT) + "\n[truncated]"
 
+    private fun shouldSuppressReportClarification(
+        text: String,
+        report: MedicationSafetyReport?,
+    ): Boolean {
+        if (report == null || !report.hasUsableResolvedReport()) return false
+        val lower = text.lowercase()
+        return "active ingredient" in lower ||
+            "active ingredients" in lower ||
+            "ingredient" in lower ||
+            "ingredients" in lower ||
+            "composition" in lower
+    }
+
+    private fun MedicationSafetyReport.hasUsableResolvedReport(): Boolean =
+        checked_pair_count > 0 ||
+            findings.isNotEmpty() ||
+            duplicate_ingredient_warnings.isNotEmpty() ||
+            normalized_medications.count { it.resolved && it.canonical_name != null } >= 2
+
+    private fun reportFallbackText(report: MedicationSafetyReport): String {
+        val resolved = report.normalized_medications
+            .filter { it.resolved }
+            .mapNotNull { it.canonical_name }
+            .distinct()
+        val unresolved = report.unresolved_medications.map { it.input_name }.distinct()
+        val lines = mutableListOf<String>()
+        if (resolved.isNotEmpty()) {
+            lines += "I identified and checked: ${resolved.joinToString(", ")}."
+        }
+        if (report.findings.isNotEmpty()) {
+            val finding = report.findings.first()
+            val severity = finding.severity ?: "flagged"
+            lines += "${finding.drug_a} with ${finding.drug_b} is flagged as $severity in the local evidence."
+            val effects = finding.effects.take(3).map { it.adverse_effect }
+            if (effects.isNotEmpty()) lines += "Main concern: ${effects.joinToString(", ")}."
+        } else if (report.checked_pair_count > 0) {
+            lines += "I did not find a flagged interaction among the medicines I could identify in the local evidence checked."
+        }
+        if (unresolved.isNotEmpty()) {
+            lines += "I could not identify these confidently, so I did not check them: ${unresolved.joinToString(", ")}."
+        }
+        return lines.joinToString("\n\n").ifBlank { HARD_FAILURE_MESSAGE }
+    }
+
+    internal data class ParsedCall(val name: String, val args: Map<String, String>)
+
+    internal sealed interface ProtocolReply {
+        data class Answer(val text: String) : ProtocolReply
+        data class Ask(val text: String) : ProtocolReply
+        data class Calls(val calls: List<ParsedCall>) : ProtocolReply
+        data class Unstructured(val text: String) : ProtocolReply
+    }
+
+    internal fun parseProtocol(raw: String): ProtocolReply {
+        val text = stripMarkup(raw).trim()
+        if (text.isEmpty()) return ProtocolReply.Unstructured("")
+
+        val answerMatch = ANSWER_REGEX.find(text)
+        val askMatch = ASK_REGEX.find(text)
+        val callMatches = CALL_REGEX.findAll(text).toList()
+
+        val earliest = listOfNotNull(
+            answerMatch?.let { Verb.ANSWER to it.range.first },
+            askMatch?.let { Verb.ASK to it.range.first },
+            callMatches.firstOrNull()?.let { Verb.CALL to it.range.first },
+        ).minByOrNull { it.second }
+
+        return when (earliest?.first) {
+            Verb.ANSWER -> {
+                val captured = answerMatch!!.groupValues[1].trim()
+                ProtocolReply.Answer(captured.ifEmpty { text })
+            }
+            Verb.ASK -> {
+                val captured = askMatch!!.groupValues[1].trim()
+                ProtocolReply.Ask(captured.ifEmpty { text })
+            }
+            Verb.CALL -> {
+                val parsed = callMatches.mapNotNull { match ->
+                    val name = match.groupValues[1].trim().lowercase()
+                    val argsRaw = match.groupValues.getOrNull(2)?.trim().orEmpty()
+                    if (name.isBlank()) null else ParsedCall(name = name, args = parseCallArgs(argsRaw))
+                }
+                if (parsed.isEmpty()) ProtocolReply.Unstructured(text) else ProtocolReply.Calls(parsed)
+            }
+            null -> ProtocolReply.Unstructured(text)
+        }
+    }
+
+    private fun stripMarkup(raw: String): String {
+        // Some small models wrap their reply in code fences or angle-bracket tokens.
+        // Strip the most common noise so the verb regex can match cleanly.
+        var text = raw
+        text = text.replace(Regex("```[a-zA-Z0-9_-]*"), "")
+        text = text.replace("```", "")
+        text = text.replace(Regex("<\\|[^|>]*\\|?>"), "")
+        text = text.replace(Regex("</?tool_call>", RegexOption.IGNORE_CASE), "")
+        return text
+    }
+
+    private fun parseCallArgs(raw: String): Map<String, String> {
+        if (raw.isBlank()) return emptyMap()
+        return runCatching {
+            val element = json.parseToJsonElement(raw)
+            if (element !is JsonObject) return@runCatching emptyMap<String, String>()
+            buildMap {
+                element.forEach { (key, value) ->
+                    put(key, jsonElementToArgString(value))
+                }
+            }
+        }.getOrElse { emptyMap() }
+    }
+
+    private fun jsonElementToArgString(element: JsonElement): String = when (element) {
+        is JsonPrimitive -> element.contentOrNull.orEmpty()
+        is JsonArray -> json.encodeToString(JsonArray.serializer(), JsonArray(
+            element.map { item ->
+                when (item) {
+                    is JsonPrimitive -> JsonPrimitive(item.contentOrNull.orEmpty())
+                    else -> JsonPrimitive(item.toString())
+                }
+            },
+        ))
+        is JsonObject -> element.toString()
+    }
+
+    private enum class Verb { ANSWER, ASK, CALL }
+
     private companion object {
+        const val TAG = "MedLens"
         const val TOOL_RESULT_CHAR_LIMIT = 3600
+        const val HARD_FAILURE_MESSAGE = "I had trouble checking that just now. Please try again, or type the medicine names directly."
+
+        val ANSWER_REGEX = Regex(
+            """(?:^|\n)\s*ANSWER\s*[:\-]\s*([\s\S]+)""",
+            setOf(RegexOption.IGNORE_CASE),
+        )
+        val ASK_REGEX = Regex(
+            """(?:^|\n)\s*ASK\s*[:\-]\s*([^\n\r]+)""",
+            setOf(RegexOption.IGNORE_CASE),
+        )
+        val CALL_REGEX = Regex(
+            """(?:^|\n)\s*CALL\s*[:\-]\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(\{[^\n}]*\})?""",
+            setOf(RegexOption.IGNORE_CASE),
+        )
     }
 }
 
@@ -387,132 +708,35 @@ private fun explicitMedicationPiece(raw: String): String? {
     }
 }
 
-internal fun deterministicTextFromReport(report: MedicationSafetyReport): String {
-    val lines = mutableListOf<String>()
-    val unresolvedNames = report.unresolved_medications.joinToString(", ") { it.input_name }
+private object Log {
+    fun i(tag: String, message: String) {
+        runCatching { AndroidLog.i(tag, message) }
+            .onFailure { println("I/$tag: $message") }
+    }
 
-    if (report.duplicate_ingredient_warnings.isNotEmpty()) {
-        report.duplicate_ingredient_warnings.take(3).forEach { warning ->
-            lines += warning.practical_summary
-            if (warning.dose_context_needed.isNotBlank()) {
-                lines += warning.dose_context_needed
+    fun w(tag: String, message: String) {
+        runCatching { AndroidLog.w(tag, message) }
+            .onFailure { println("W/$tag: $message") }
+    }
+
+    fun w(tag: String, message: String, throwable: Throwable) {
+        runCatching { AndroidLog.w(tag, message, throwable) }
+            .onFailure {
+                println("W/$tag: $message")
+                throwable.printStackTrace()
             }
-            lines += ""
-        }
     }
 
-    if (report.findings.isNotEmpty()) {
-        if (report.findings.size == 1) {
-            val finding = report.findings.first()
-            val severity = finding.severity ?: "flagged"
-            lines += "This combination is flagged as $severity: ${finding.drug_a} with ${finding.drug_b}."
-        } else {
-            lines += "I found ${report.findings.size} flagged interaction(s) in the medicines checked."
-        }
-        report.findings.take(3).forEach { finding ->
-            lines += ""
-            lines += deterministicFindingLines(finding, includeLead = report.findings.size != 1)
-            val sourceLines = sourceLinesFromFinding(finding)
-            if (sourceLines.isNotEmpty()) {
-                lines += ""
-                lines += "Sources:"
-                lines += sourceLines
-            } else {
-                lines += ""
-                lines += "Sources:"
-                lines += "- ${finding.drug_a} + ${finding.drug_b}: no URL on file"
+    fun e(tag: String, message: String) {
+        runCatching { AndroidLog.e(tag, message) }
+            .onFailure { println("E/$tag: $message") }
+    }
+
+    fun e(tag: String, message: String, throwable: Throwable) {
+        runCatching { AndroidLog.e(tag, message, throwable) }
+            .onFailure {
+                println("E/$tag: $message")
+                throwable.printStackTrace()
             }
-        }
-        if (report.findings.size > 3) {
-            lines += ""
-            lines += "There are ${report.findings.size - 3} more findings available. Ask for details and I can walk through them."
-        }
-    } else if (report.checked_pair_count > 0) {
-        lines += "I did not find a flagged interaction among the medicines I could identify in the evidence I checked."
     }
-
-    if (report.unresolved_medications.isNotEmpty()) {
-        if (lines.isNotEmpty()) lines += ""
-        lines += "I could not identify these confidently, so I did not check them: $unresolvedNames."
-    }
-
-    return lines.joinToString("\n").trim()
-}
-
-private fun deterministicFindingLines(finding: KnownInteraction, includeLead: Boolean = true): List<String> {
-    val drugA = finding.drug_a
-    val drugB = finding.drug_b
-    val severity = finding.severity ?: "flagged"
-    val effects = finding.effects.take(3).map { it.adverse_effect }
-
-    val lines = mutableListOf<String>()
-    if (includeLead) {
-        lines += "$drugA with $drugB is flagged as $severity."
-    }
-    if (effects.isNotEmpty()) {
-        lines += "The main concern is ${effects.joinToString(", ")}."
-        plainEffectNote(effects.first())?.let { lines += it }
-    }
-    finding.practical_guidance?.let { guidance ->
-        if (guidance.practical_summary.isNotBlank()) {
-            lines += guidance.practical_summary
-        }
-        if (guidance.dose_context_needed.isNotBlank()) {
-            lines += guidance.dose_context_needed
-        }
-    }
-    if (severity.equals("Major", ignoreCase = true)) {
-        lines += "Because this is marked Major, check with a pharmacist or prescriber before taking them together."
-    } else if (effects.isNotEmpty()) {
-        lines += "If you are using them together, keep an eye on those symptoms and ask a pharmacist if they show up."
-    }
-    return lines
-}
-
-private fun plainEffectNote(effectName: String): String? {
-    val normalized = effectName.lowercase()
-    return when {
-        "gastrointestinal bleeding" in normalized ->
-            "In plain language, gastrointestinal bleeding means bleeding in the stomach or intestines."
-        "intracranial hemorrhage" in normalized ->
-            "In plain language, intracranial hemorrhage means bleeding inside the skull."
-        "qt prolongation" in normalized ->
-            "In plain language, QT prolongation is an electrical heart-rhythm change that can become dangerous in some people."
-        "torsades" in normalized ->
-            "In plain language, torsades de pointes is a dangerous abnormal heart rhythm."
-        "acute anemia" in normalized ->
-            "In plain language, acute anemia means a sudden drop in red blood cells or hemoglobin."
-        else -> null
-    }
-}
-
-private fun sourceLinesFromFinding(finding: KnownInteraction): List<String> {
-    val urls = finding.source_urls.take(20)
-    if (urls.isEmpty()) return emptyList()
-    val regions = finding.source_regions.take(4)
-    val bases = compactBasisItems(finding.source_bases, 3)
-    val metaParts = mutableListOf<String>()
-    if (regions.isNotEmpty()) metaParts += "regions: ${regions.joinToString(", ")}"
-    if (bases.isNotEmpty()) metaParts += "basis: ${bases.joinToString("; ")}"
-    val meta = if (metaParts.isEmpty()) "" else " (${metaParts.joinToString("; ")})"
-    val visible = urls.take(3).map { "- ${finding.drug_a} + ${finding.drug_b}: $it$meta" }
-    return if (urls.size > 3) {
-        visible + "- ${finding.drug_a} + ${finding.drug_b}: ${urls.size - 3} more source URL(s) on file."
-    } else {
-        visible
-    }
-}
-
-private fun compactBasisItems(values: List<String>, limit: Int): List<String> {
-    val seen = mutableListOf<String>()
-    for (raw in values) {
-        for (piece in raw.split(";")) {
-            val item = piece.trim()
-            if (item.isNotEmpty() && item !in seen) {
-                seen += item
-                if (seen.size >= limit) return seen
-            }
-        }
-    }
-    return seen
 }

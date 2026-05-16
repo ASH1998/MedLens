@@ -1,5 +1,42 @@
 # Android Changelog
 
+## v1.1.0 - 2026-05-16
+
+- Updated Android package metadata to `versionCode = 110` and
+  `versionName = "v1.1.0"`.
+- Reworked the Android LiteRT agent loop to avoid native tool-call parse
+  failures by using a plain `CALL` / `ASK` / `ANSWER` protocol.
+- Improved multi-image medicine checks so extracted names and typed medicine
+  names are checked together.
+- Added protection against asking for active ingredients after the structured
+  report already resolved them.
+- Included normalized active ingredients in compact structured-report tool
+  results.
+- Increased the default tool loop budget to 5 rounds and the turn timeout to 2
+  minutes.
+- Tuned patient-facing answers to use warmer language and light bold formatting
+  such as `**Bottom line:**`, `**Why:**`, and `**Watch for:**`.
+- Added a subtle Settings credit link for `Ashutosh Mishra`.
+- For combinations with no flagged local finding, answers now provide cautious
+  general medication guidance instead of leading with a database-style no-finding
+  sentence.
+- Rebuilt the debug APK from the Android Gradle project for release testing.
+
+## v1.0.0 - 2026-05-16
+
+- Updated Android package metadata to `versionCode = 100` and
+  `versionName = "v1.0.0"` for the first release build.
+- Added the MedLens logo as the Android launcher icon and packaged app icon.
+- Refreshed the Android Compose UI with MedLens navy, teal, and purple
+  branding, including the header, conversation list, message bubbles, composer,
+  source chips, and first-run screen.
+- Added the MedLens logo before the app name in the chat header, sidebar, and
+  assistant messages.
+- Simplified LiteRT-LM backend settings to plain `CPU` and `GPU` choices.
+- Changed attached medicine images in sent chat messages to a two-column tile
+  layout.
+- Rebuilt the debug APK from the Android Gradle project for release testing.
+
 ## v0.1.12-pre-release - 2026-05-15
 
 - Updated Android package metadata to `versionCode = 12` and

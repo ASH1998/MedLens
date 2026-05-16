@@ -1,6 +1,7 @@
 package com.medlens.android.ui
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.medlens.android.data.ConversationStore
@@ -19,6 +20,7 @@ import com.medlens.core.agent.model.ToolCallRecord
 import com.medlens.core.data.DatabaseInstaller
 import com.medlens.core.data.SafetyRepository
 import com.medlens.core.data.SqliteSafetyRepository
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -32,6 +34,8 @@ sealed interface SetupStage {
     data object Ready : SetupStage
     data class Error(val message: String) : SetupStage
 }
+
+private const val MIN_SETUP_SCREEN_MILLIS = 1_500L
 
 data class MedLensUiState(
     val setupStage: SetupStage = SetupStage.Checking,
@@ -116,6 +120,7 @@ class MedLensViewModel(
 
     fun bootstrap() {
         viewModelScope.launch {
+            val setupStartedAt = System.currentTimeMillis()
             _uiState.update { it.copy(setupStage = SetupStage.Copying) }
             runCatching {
                 val installed = installer.ensureInstalled()
@@ -123,17 +128,34 @@ class MedLensViewModel(
                 repository = SqliteSafetyRepository(installed)
             }.onSuccess {
                 hydrateSession(activeConversation())
+                delayRemainingSetupTime(setupStartedAt)
                 _uiState.update { state -> state.copy(setupStage = SetupStage.Ready) }
             }.onFailure { error ->
+                delayRemainingSetupTime(setupStartedAt)
                 _uiState.update { state -> state.copy(setupStage = SetupStage.Error(error.message ?: "Setup failed")) }
             }
         }
     }
 
+    private suspend fun delayRemainingSetupTime(setupStartedAt: Long) {
+        val remaining = MIN_SETUP_SCREEN_MILLIS - (System.currentTimeMillis() - setupStartedAt)
+        if (remaining > 0) delay(remaining)
+    }
+
     fun sendMessage(message: String) {
-        if (message.isBlank() || _uiState.value.busy) return
-        val repo = repository ?: return
-        val provider = liteRtProvider ?: return
+        Log.i("MedLens", "VM.sendMessage user text='${message.take(200)}' (${message.length} chars)")
+        if (message.isBlank() || _uiState.value.busy) {
+            Log.w("MedLens", "VM.sendMessage skipped (blank=${message.isBlank()}, busy=${_uiState.value.busy})")
+            return
+        }
+        val repo = repository ?: run {
+            Log.e("MedLens", "VM.sendMessage no repository ready")
+            return
+        }
+        val provider = liteRtProvider ?: run {
+            Log.e("MedLens", "VM.sendMessage no liteRtProvider ready")
+            return
+        }
         val orchestrator = AgentOrchestrator(
             dispatcher = ToolDispatcher(repo),
             provider = provider,
@@ -157,6 +179,7 @@ class MedLensViewModel(
             runCatching {
                 orchestrator.runTurn(session, message, audiencePrompt = _uiState.value.audienceStyle.prompt())
             }.onSuccess { result ->
+                Log.i("MedLens", "VM.sendMessage SUCCESS tools=${result.usedTools} finalText=${result.finalText.length} chars")
                 val active = activeConversation()
                 val updatedConversation = active?.copy(
                     messages = active.messages.map {
@@ -168,6 +191,7 @@ class MedLensViewModel(
                 if (updatedConversation != null) saveConversation(updatedConversation)
                 _uiState.update { it.copy(trace = result.trace, busy = false) }
             }.onFailure { error ->
+                Log.e("MedLens", "VM.sendMessage runTurn threw ${error::class.java.simpleName}: ${error.message}", error)
                 val active = activeConversation()
                 val failureText = turnFailureMessage(error)
                 val updatedConversation = active?.copy(
@@ -187,11 +211,24 @@ class MedLensViewModel(
     }
 
     fun sendImageMessage(imagePaths: List<String>, userText: String) {
-        if (_uiState.value.busy) return
+        Log.i("MedLens", "VM.sendImageMessage ${imagePaths.size} images, userText='${userText.take(120)}'")
+        if (_uiState.value.busy) {
+            Log.w("MedLens", "VM.sendImageMessage skipped (busy)")
+            return
+        }
         val safeImagePaths = imagePaths.take(MAX_IMAGE_ATTACHMENTS)
-        if (safeImagePaths.isEmpty()) return
-        val repo = repository ?: return
-        val provider = liteRtProvider ?: return
+        if (safeImagePaths.isEmpty()) {
+            Log.w("MedLens", "VM.sendImageMessage skipped (no images)")
+            return
+        }
+        val repo = repository ?: run {
+            Log.e("MedLens", "VM.sendImageMessage no repository ready")
+            return
+        }
+        val provider = liteRtProvider ?: run {
+            Log.e("MedLens", "VM.sendImageMessage no liteRtProvider ready")
+            return
+        }
         val orchestrator = AgentOrchestrator(
             dispatcher = ToolDispatcher(repo),
             provider = provider,
@@ -222,15 +259,26 @@ class MedLensViewModel(
 
             runCatching {
                 val extractedParts = safeImagePaths.mapIndexed { index, imagePath ->
+                    Log.i("MedLens", "VM image[${index + 1}/${safeImagePaths.size}] OCR start: $imagePath")
                     val text = provider.extractMedicineCandidatesFromImage(imagePath, userText)
+                    Log.i("MedLens", "VM image[${index + 1}] OCR done (${text.length} chars)")
                     "Image ${index + 1}:\n${text.trim()}"
                 }.filter { it.isNotBlank() }
                 val extracted = extractedParts.joinToString("\n\n")
                 if (extracted.isBlank()) error("No visible medicine text was extracted from the attached image.")
-                val candidates = medicationCandidatesFromExtraction(extracted)
+                val candidatesFromExtraction = medicationCandidatesFromExtraction(extracted)
+                val candidatesFromUserText = medicationCandidatesFromUserText(userText)
+                Log.i("MedLens", "VM candidates from images: $candidatesFromExtraction")
+                Log.i("MedLens", "VM candidates from user text: $candidatesFromUserText")
+                val candidates = (candidatesFromExtraction + candidatesFromUserText)
+                    .distinctBy { it.lowercase() }
+                    .take(8)
+                Log.i("MedLens", "VM combined candidates (final): $candidates")
                 val agentMessage = imageAgentMessage(extracted, candidates, userText)
+                Log.i("MedLens", "VM handing off to orchestrator (agentMessage ${agentMessage.length} chars)")
                 orchestrator.runTurn(session, agentMessage, audiencePrompt = _uiState.value.audienceStyle.prompt())
             }.onSuccess { result ->
+                Log.i("MedLens", "VM.sendImageMessage SUCCESS tools=${result.usedTools} finalText=${result.finalText.length} chars")
                 val active = activeConversation()
                 val updatedConversation = active?.copy(
                     messages = active.messages.map {
@@ -242,6 +290,7 @@ class MedLensViewModel(
                 if (updatedConversation != null) saveConversation(updatedConversation)
                 _uiState.update { it.copy(trace = result.trace, busy = false) }
             }.onFailure { error ->
+                Log.e("MedLens", "VM.sendImageMessage failed: ${error::class.java.simpleName}: ${error.message}", error)
                 val active = activeConversation()
                 val failureText = imageTurnFailureMessage(error)
                 val updatedConversation = active?.copy(
@@ -340,8 +389,9 @@ class MedLensViewModel(
                 append(candidate)
                 append("\n")
             }
+            append("\nIf the user typed another medicine in their question, it is already included in this list. Check all listed names together.")
         }
-        append("\n\nUse only deterministic local evidence to answer. Do not mention internal tools, extraction steps, databases, or that the user provided images unless they explicitly ask how the app read them.")
+        append("\n\nDo not mention internal tools, extraction steps, databases, or that the user provided images unless they explicitly ask how the app read them.")
         append("\nAnswer naturally as if the user typed the medicine names. Do not start with a preface like \"you provided an image\" or \"I see an image\".")
         if (userText.isBlank()) {
             append("\nUser intent: identify the visible medicines and check relevant medication safety concerns among them.")
@@ -386,6 +436,49 @@ class MedLensViewModel(
         return candidates.take(8)
     }
 
+    private fun medicationCandidatesFromUserText(userText: String): List<String> {
+        val compact = userText.replace(Regex("\\s+"), " ").trim()
+        if (compact.isBlank()) return emptyList()
+        if (!Regex("(?i)\\b(and|with|plus)\\b|[+&]").containsMatchIn(compact)) return emptyList()
+
+        val rejectedTerms = listOf(
+            "this med",
+            "these meds",
+            "this medicine",
+            "these medicines",
+            "medicine",
+            "medication",
+            "medications",
+            "fever",
+            "safe",
+            "okay",
+            "together",
+            "interaction",
+        )
+        return compact
+            .split(Regex("(?i)\\s+(?:and|with|plus)\\s+|\\s*[+&]\\s*"))
+            .map { raw ->
+                raw
+                    .replace(
+                        Regex(
+                            "(?i)^(what\\s+about|what\\s+if\\s+i\\s+take|can\\s+i\\s+take|can\\s+you\\s+take|is\\s+it\\s+(?:ok|okay)\\s+to\\s+take|if\\s+i\\s+take|i\\s+take|taking|take)\\s+",
+                        ),
+                        "",
+                    )
+                    .replace(Regex("(?i)\\b(?:safe|okay|ok|together|interaction|interactions)\\b"), " ")
+                    .replace(Regex("\\s+"), " ")
+                    .trim()
+                    .trim('-', ':', ',', '.', '?', '!')
+                    .trim()
+            }
+            .filter { item ->
+                item.length in 3..60 &&
+                    item.any { it.isLetter() } &&
+                    rejectedTerms.none { item.equals(it, ignoreCase = true) }
+            }
+            .take(4)
+    }
+
     private fun simplifiedCandidate(value: String): String? {
         val simplified = value
             .replace(Regex("(?i)\\b\\d+(?:\\.\\d+)?\\s*(?:mg|mcg|g|ml|iu)\\b"), " ")
@@ -397,15 +490,11 @@ class MedLensViewModel(
         return simplified.takeIf { it.length >= 3 && !it.equals(value, ignoreCase = true) }
     }
 
-    private fun turnFailureMessage(error: Throwable): String {
-        val detail = error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
-        return "I couldn't finish that turn — $detail. You can try rephrasing or asking again."
-    }
+    private fun turnFailureMessage(error: Throwable): String =
+        "I had trouble checking that just now. Please try again, or type the medicine names directly."
 
-    private fun imageTurnFailureMessage(error: Throwable): String {
-        val detail = error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
-        return "I couldn't read the attached image clearly enough to answer — $detail. Try a sharper photo, or type the medicine names directly."
-    }
+    private fun imageTurnFailureMessage(error: Throwable): String =
+        "I couldn't read the attached image clearly enough to answer. Try a sharper photo, or type the medicine names directly."
 
     private suspend fun hydrateSession(conversation: PersistedConversation?) {
         session.transcript.clear()

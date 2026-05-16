@@ -12,12 +12,6 @@ data class ToolCall(
 )
 
 @Serializable
-data class ToolModelResponse(
-    val text: String,
-    val tool_calls: List<ToolCall>,
-)
-
-@Serializable
 data class AgentMessage(
     val role: String,
     val content: String,
@@ -26,14 +20,8 @@ data class AgentMessage(
     val name: String? = null,
 )
 
-data class ToolResultPayload(
-    val name: String,
-    val content: String,
-)
-
 interface TurnSession : AutoCloseable {
-    suspend fun sendUser(content: String): ToolModelResponse
-    suspend fun sendToolResults(results: List<ToolResultPayload>): ToolModelResponse
+    suspend fun sendMessage(content: String): String
     override fun close()
 }
 
@@ -42,7 +30,6 @@ interface NativeToolProvider {
     suspend fun startTurn(
         systemPrompt: String,
         priorTranscript: List<AgentMessage>,
-        tools: List<ToolSchema>,
     ): TurnSession
 }
 
