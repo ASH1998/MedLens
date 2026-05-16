@@ -1,5 +1,20 @@
 # Android Changelog
 
+## v1.0.0 - 2026-05-16
+
+- Updated Android package metadata to `versionCode = 100` and
+  `versionName = "v1.0.0"` for the first release build.
+- Added the MedLens logo as the Android launcher icon and packaged app icon.
+- Refreshed the Android Compose UI with MedLens navy, teal, and purple
+  branding, including the header, conversation list, message bubbles, composer,
+  source chips, and first-run screen.
+- Added the MedLens logo before the app name in the chat header, sidebar, and
+  assistant messages.
+- Simplified LiteRT-LM backend settings to plain `CPU` and `GPU` choices.
+- Changed attached medicine images in sent chat messages to a two-column tile
+  layout.
+- Rebuilt the debug APK from the Android Gradle project for release testing.
+
 ## v0.1.12-pre-release - 2026-05-15
 
 - Updated Android package metadata to `versionCode = 12` and
