@@ -40,8 +40,8 @@ android {
         applicationId = "com.medlens.android"
         minSdk = 31
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.1.12-pre-release"
+        versionCode = 100
+        versionName = "v1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
@@ -88,6 +88,7 @@ android {
     }
 
     sourceSets["main"].assets.srcDir(medlensAssetDir)
+    sourceSets["main"].assets.srcDir("../assets")
 }
 
 tasks.named("preBuild") {

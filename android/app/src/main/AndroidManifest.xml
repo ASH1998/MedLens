@@ -7,7 +7,9 @@
     <application
         android:name=".MedLensApplication"
         android:allowBackup="true"
+        android:icon="@drawable/logo"
         android:label="@string/app_name"
+        android:roundIcon="@drawable/logo"
         android:supportsRtl="true"
         android:theme="@style/Theme.MedLens">
         <uses-native-library android:name="libvndksupport.so" android:required="false" />
