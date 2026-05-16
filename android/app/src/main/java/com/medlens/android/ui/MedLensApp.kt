@@ -11,6 +11,7 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
@@ -26,13 +27,18 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
@@ -43,18 +49,19 @@ import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
-import androidx.compose.material.icons.outlined.Send
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -68,6 +75,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -77,9 +87,11 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.medlens.android.data.LiteRtBackendPref
@@ -109,17 +121,19 @@ private fun FirstRunScreen(message: String) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.surfaceContainerLowest),
+            .background(MedLensBackgroundBrush),
         contentAlignment = Alignment.Center,
     ) {
         Card(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(24.dp),
-            shape = RoundedCornerShape(16.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.92f)),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
         ) {
-            Column(modifier = Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("MedLens", style = MaterialTheme.typography.labelLarge)
+            Column(modifier = Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                MedLensBrandHeader(logoSize = 42.dp, titleStyle = MaterialTheme.typography.titleLarge)
                 Text("Preparing local safety data", style = MaterialTheme.typography.headlineSmall)
                 Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -166,50 +180,29 @@ private fun ChatShell(
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(MaterialTheme.colorScheme.surface),
+                        .background(MedLensBackgroundBrush),
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 20.dp, vertical = 16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (!sidebarOpen) {
-                                IconButton(onClick = { sidebarOpen = true }) {
-                                    Icon(Icons.Outlined.Menu, contentDescription = "Show conversations")
-                                }
-                                Spacer(modifier = Modifier.width(4.dp))
-                            }
-                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                Text("MedLens", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-                                Text(
-                                    "${state.providerLabel} · ${state.modelState.toLabel()} · ${activeConversation(state)?.medications?.size ?: 0} meds in session",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                        IconButton(onClick = { settingsOpen = true }) {
-                            Icon(Icons.Outlined.Settings, contentDescription = "Settings")
-                        }
-                    }
-
-                    Divider()
+                    MedLensTopBar(
+                        state = state,
+                        showMenu = !sidebarOpen,
+                        onMenu = { sidebarOpen = true },
+                        onSettings = { settingsOpen = true },
+                    )
 
                     LazyColumn(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxWidth()
-                            .padding(horizontal = 20.dp, vertical = 12.dp),
+                            .padding(horizontal = 18.dp, vertical = 14.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        item {
-                            ModelStatusCard(
-                                modelState = state.modelState,
-                                onDownload = viewModel::enqueueModelDownload,
-                            )
+                        if (state.modelState !is ModelState.Ready) {
+                            item {
+                                ModelStatusCard(
+                                    modelState = state.modelState,
+                                    onDownload = viewModel::enqueueModelDownload,
+                                )
+                            }
                         }
                         items(activeConversation(state)?.messages ?: emptyList(), key = { it.id }) { message ->
                             MessageBubble(
@@ -230,7 +223,10 @@ private fun ChatShell(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(16.dp),
+                            .background(Color.White.copy(alpha = 0.88f))
+                            .padding(horizontal = 18.dp, vertical = 12.dp)
+                            .navigationBarsPadding()
+                            .imePadding(),
                     ) {
                         if (pendingImagePaths.isNotEmpty()) {
                             PendingImageAttachments(
@@ -249,8 +245,12 @@ private fun ChatShell(
                             IconButton(
                                 onClick = { cameraOpen = true },
                                 enabled = !state.busy && state.modelState is ModelState.Ready,
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(CircleShape)
+                                    .background(MedLensMint),
                             ) {
-                                Icon(Icons.Outlined.PhotoCamera, contentDescription = "Use camera")
+                                Icon(Icons.Outlined.PhotoCamera, contentDescription = "Use camera", tint = MedLensNavy)
                             }
                             Spacer(modifier = Modifier.width(8.dp))
                             OutlinedTextField(
@@ -258,6 +258,13 @@ private fun ChatShell(
                                 onValueChange = { draft = it },
                                 modifier = Modifier.weight(1f),
                                 placeholder = { Text(if (state.modelState is ModelState.Ready) "Ask about medications..." else "Download Gemma to chat") },
+                                shape = RoundedCornerShape(8.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = MedLensTeal,
+                                    unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.65f),
+                                    focusedContainerColor = Color.White,
+                                    unfocusedContainerColor = Color.White,
+                                ),
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             IconButton(
@@ -273,8 +280,16 @@ private fun ChatShell(
                                     }
                                 },
                                 enabled = canSend,
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(CircleShape)
+                                    .background(if (canSend) MedLensTeal else MaterialTheme.colorScheme.surfaceVariant),
                             ) {
-                                Icon(Icons.Outlined.Send, contentDescription = "Send")
+                                Icon(
+                                    Icons.AutoMirrored.Outlined.Send,
+                                    contentDescription = "Send",
+                                    tint = if (canSend) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
                         }
                         Spacer(modifier = Modifier.height(6.dp))
@@ -311,7 +326,7 @@ private fun ChatShell(
                     Button(onClick = viewModel::enqueueModelDownload, enabled = state.modelState !is ModelState.Downloading) {
                         Text("Download Gemma Model")
                     }
-                    Divider()
+                    HorizontalDivider()
                     Text("How technical?", style = MaterialTheme.typography.titleSmall)
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(
@@ -334,32 +349,22 @@ private fun ChatShell(
                         )
                         Text("Simple language")
                     }
-                    Divider()
+                    HorizontalDivider()
                     Text("LiteRT-LM backend", style = MaterialTheme.typography.titleSmall)
-                    Text(
-                        "Choose CPU on the Android emulator (its GPU has no OpenCL and the OpenGL delegate is unimplemented). Use GPU on physical devices for speed.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(
                             selected = state.backendPref == LiteRtBackendPref.CPU,
                             onClick = { viewModel.setBackendPref(LiteRtBackendPref.CPU) },
                         )
-                        Text("CPU (emulator-safe)")
+                        Text("CPU")
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(
                             selected = state.backendPref == LiteRtBackendPref.GPU,
                             onClick = { viewModel.setBackendPref(LiteRtBackendPref.GPU) },
                         )
-                        Text("GPU (physical device)")
+                        Text("GPU")
                     }
-                    Text(
-                        "The LiteRT-LM model manager is wired for download and storage. Inference integration still needs Android SDK validation on a real build machine.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
                     Spacer(modifier = Modifier.height(12.dp))
                 }
             }
@@ -382,13 +387,121 @@ private fun ChatShell(
 }
 
 @Composable
+private fun MedLensTopBar(
+    state: MedLensUiState,
+    showMenu: Boolean,
+    onMenu: () -> Unit,
+    onSettings: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .background(Color.White.copy(alpha = 0.86f))
+            .padding(horizontal = 18.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+            if (showMenu) {
+                IconButton(onClick = onMenu) {
+                    Icon(Icons.Outlined.Menu, contentDescription = "Show conversations", tint = MedLensNavy)
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+            }
+            MedLensBrandHeader(logoSize = 38.dp, titleStyle = MaterialTheme.typography.headlineSmall)
+            Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                "${state.modelState.toLabel()} · ${activeConversation(state)?.medications?.size ?: 0} meds",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        IconButton(
+            onClick = onSettings,
+            modifier = Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(MedLensMint),
+        ) {
+            Icon(Icons.Outlined.Settings, contentDescription = "Settings", tint = MedLensNavy)
+        }
+    }
+}
+
+@Composable
+private fun MedLensBrandHeader(
+    logoSize: Dp,
+    titleStyle: TextStyle,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        MedLensLogo(size = logoSize)
+        Spacer(modifier = Modifier.width(10.dp))
+        Text(
+            buildAnnotatedString {
+                pushStyle(SpanStyle(color = MedLensNavy, fontWeight = FontWeight.Bold))
+                append("Med")
+                pop()
+                pushStyle(SpanStyle(color = MedLensTeal, fontWeight = FontWeight.Bold))
+                append("Lens")
+                pop()
+            },
+            style = titleStyle,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun MedLensLogo(size: Dp) {
+    val context = LocalContext.current
+    val logo = remember(context) {
+        runCatching {
+            context.assets.open("logo.png").use { stream ->
+                BitmapFactory.decodeStream(stream)?.asImageBitmap()
+            }
+        }.getOrNull()
+    }
+    if (logo != null) {
+        Image(
+            bitmap = logo,
+            contentDescription = "MedLens logo",
+            modifier = Modifier
+                .size(size)
+                .clip(RoundedCornerShape(8.dp)),
+            contentScale = ContentScale.Crop,
+        )
+    } else {
+        Box(
+            modifier = Modifier
+                .size(size)
+                .clip(RoundedCornerShape(8.dp))
+                .background(MedLensMint),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Outlined.Medication,
+                contentDescription = "MedLens logo",
+                tint = MedLensTeal,
+                modifier = Modifier.size(size * 0.58f),
+            )
+        }
+    }
+}
+
+@Composable
 private fun PendingImageAttachments(
     imagePaths: List<String>,
     onRemove: (String) -> Unit,
 ) {
     Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
-        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.94f)),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, MedLensTeal.copy(alpha = 0.12f)),
     ) {
         Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(
@@ -427,7 +540,9 @@ private fun PendingImageThumb(
             Image(
                 bitmap = bitmap,
                 contentDescription = "Attached medicine image",
-                modifier = Modifier.size(56.dp),
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(RoundedCornerShape(8.dp)),
                 contentScale = ContentScale.Crop,
             )
         } else {
@@ -626,54 +741,65 @@ private fun Sidebar(
 ) {
     Column(
         modifier = modifier
-            .background(MaterialTheme.colorScheme.surfaceContainerLowest)
+            .background(MedLensSidebarBrush)
+            .statusBarsPadding()
             .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                 IconButton(onClick = onToggle) {
-                    Icon(Icons.Outlined.Menu, contentDescription = "Hide conversations")
+                    Icon(Icons.Outlined.Menu, contentDescription = "Hide conversations", tint = MedLensNavy)
                 }
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Conversations", style = MaterialTheme.typography.titleMedium)
+                Spacer(modifier = Modifier.width(4.dp))
+                MedLensBrandHeader(logoSize = 32.dp, titleStyle = MaterialTheme.typography.titleLarge)
             }
             IconButton(onClick = onNew) {
-                Icon(Icons.Outlined.Add, contentDescription = "New")
+                Icon(Icons.Outlined.Add, contentDescription = "New", tint = MedLensNavy)
             }
         }
         Button(
             onClick = onNew,
             modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = MedLensPurple),
+            elevation = ButtonDefaults.buttonElevation(defaultElevation = 2.dp),
         ) {
             Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(modifier = Modifier.width(8.dp))
             Text("New chat")
         }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             items(conversations, key = { it.id }) { conversation ->
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { onSelect(conversation.id) },
+                    shape = RoundedCornerShape(8.dp),
                     colors = CardDefaults.cardColors(
                         containerColor = if (conversation.id == activeId) {
-                            MaterialTheme.colorScheme.secondaryContainer
+                            Color(0xFFEDE6FF)
                         } else {
-                            MaterialTheme.colorScheme.surface
+                            Color.White.copy(alpha = 0.88f)
                         },
                     ),
+                    border = BorderStroke(
+                        1.dp,
+                        if (conversation.id == activeId) MedLensPurple.copy(alpha = 0.30f) else Color.White.copy(alpha = 0.70f),
+                    ),
+                    elevation = CardDefaults.cardElevation(defaultElevation = if (conversation.id == activeId) 4.dp else 1.dp),
                 ) {
-                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
                         Text(
                             conversation.title,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             style = MaterialTheme.typography.titleSmall,
+                            color = MedLensNavy,
                         )
                         Text(
                             "${conversation.medications.size} meds · ${conversation.messages.size} messages",
@@ -684,7 +810,7 @@ private fun Sidebar(
                             onClick = { onDelete(conversation.id) },
                             modifier = Modifier.align(Alignment.End),
                         ) {
-                            Text("Delete")
+                            Text("Delete", color = MedLensPurple)
                         }
                     }
                 }
@@ -698,9 +824,14 @@ private fun ModelStatusCard(
     modelState: ModelState,
     onDownload: () -> Unit,
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+    Card(
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.94f)),
+        border = BorderStroke(1.dp, MedLensTeal.copy(alpha = 0.14f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp),
+    ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Gemma model", style = MaterialTheme.typography.titleSmall)
+            Text("Gemma model", style = MaterialTheme.typography.titleSmall, color = MedLensNavy)
             Text(modelState.toLabel(), style = MaterialTheme.typography.bodyMedium)
             if (modelState is ModelState.Error) {
                 Text(
@@ -721,7 +852,12 @@ private fun ModelStatusCard(
                 )
             }
             if (modelState !is ModelState.Ready) {
-                Button(onClick = onDownload, enabled = modelState !is ModelState.Downloading) {
+                Button(
+                    onClick = onDownload,
+                    enabled = modelState !is ModelState.Downloading,
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MedLensTeal),
+                ) {
                     Text(if (modelState is ModelState.Error) "Retry Download" else "Download Gemma Model")
                 }
             }
@@ -749,23 +885,43 @@ private fun MessageBubble(
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
     ) {
         Card(
-            modifier = Modifier.fillMaxWidth(0.82f),
+            modifier = Modifier.fillMaxWidth(0.84f),
+            shape = RoundedCornerShape(
+                topStart = 8.dp,
+                topEnd = 8.dp,
+                bottomStart = if (isUser) 8.dp else 2.dp,
+                bottomEnd = if (isUser) 2.dp else 8.dp,
+            ),
             colors = CardDefaults.cardColors(
                 containerColor = if (isUser) {
-                    MaterialTheme.colorScheme.primaryContainer
+                    Color(0xFFE5D9FF)
                 } else {
-                    MaterialTheme.colorScheme.surfaceContainerHigh
+                    Color.White.copy(alpha = 0.95f)
                 },
             ),
+            border = BorderStroke(
+                1.dp,
+                if (isUser) MedLensPurple.copy(alpha = 0.12f) else MedLensTeal.copy(alpha = 0.12f),
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = if (isUser) 0.dp else 2.dp),
         ) {
-            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Icon(
-                        Icons.Outlined.Medication,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp),
+                    if (isUser) {
+                        Icon(
+                            Icons.Outlined.Medication,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = MedLensPurple,
+                        )
+                    } else {
+                        MedLensLogo(size = 18.dp)
+                    }
+                    Text(
+                        if (isUser) "You" else "MedLens",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (isUser) MaterialTheme.colorScheme.onSecondaryContainer else MedLensNavy,
                     )
-                    Text(if (isUser) "You" else "MedLens", style = MaterialTheme.typography.labelMedium)
                 }
                 val displayImagePaths = imagePaths.ifEmpty { listOfNotNull(imagePath) }
                 if (isUser && displayImagePaths.isNotEmpty()) {
@@ -775,6 +931,7 @@ private fun MessageBubble(
                     Text(
                         markdownBoldText(parsed.body),
                         style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
                     )
                 }
                 if (!isUser && parsed.sources.isNotEmpty()) {
@@ -796,27 +953,50 @@ private fun MessageBubble(
 @Composable
 private fun MessageImageThumbnails(imagePaths: List<String>) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        imagePaths.take(MAX_PENDING_IMAGES).forEach { imagePath ->
-            val bitmap = remember(imagePath) { BitmapFactory.decodeFile(imagePath)?.asImageBitmap() }
-            if (bitmap == null) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Icon(Icons.Outlined.PhotoCamera, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Text("Image attached", style = MaterialTheme.typography.bodyMedium)
+        imagePaths.take(MAX_PENDING_IMAGES).chunked(2).forEach { rowImages ->
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                rowImages.forEach { imagePath ->
+                    MessageImageTile(
+                        imagePath = imagePath,
+                        modifier = Modifier.weight(1f),
+                    )
                 }
-            } else {
-                Image(
-                    bitmap = bitmap,
-                    contentDescription = "Attached medicine image",
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(if (imagePaths.size == 1) 160.dp else 96.dp),
-                    contentScale = ContentScale.Fit,
-                )
+                if (rowImages.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun MessageImageTile(
+    imagePath: String,
+    modifier: Modifier = Modifier,
+) {
+    val bitmap = remember(imagePath) { BitmapFactory.decodeFile(imagePath)?.asImageBitmap() }
+    if (bitmap == null) {
+        Row(
+            modifier = modifier
+                .height(118.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(MedLensMint)
+                .padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(Icons.Outlined.PhotoCamera, contentDescription = null, modifier = Modifier.size(18.dp), tint = MedLensNavy)
+            Text("Image attached", style = MaterialTheme.typography.bodySmall, color = MedLensNavy)
+        }
+    } else {
+        Image(
+            bitmap = bitmap,
+            contentDescription = "Attached medicine image",
+            modifier = modifier
+                .height(118.dp)
+                .clip(RoundedCornerShape(8.dp)),
+            contentScale = ContentScale.Crop,
+        )
     }
 }
 
@@ -829,9 +1009,11 @@ private fun SourceReferenceText(
         text = source.label,
         modifier = Modifier
             .clickable(onClick = onClick)
-            .padding(horizontal = 2.dp, vertical = 1.dp),
+            .clip(RoundedCornerShape(8.dp))
+            .background(MedLensMint)
+            .padding(horizontal = 8.dp, vertical = 3.dp),
         style = MaterialTheme.typography.bodyMedium,
-        color = MaterialTheme.colorScheme.primary,
+        color = MedLensNavy,
         fontWeight = FontWeight.SemiBold,
     )
 }
@@ -944,5 +1126,23 @@ private fun markdownBoldText(value: String): AnnotatedString = buildAnnotatedStr
     }
 }
 
+private val MedLensNavy = Color(0xFF071F49)
+private val MedLensTeal = Color(0xFF009F8B)
+private val MedLensPurple = Color(0xFF7052B7)
+private val MedLensMint = Color(0xFFE4F7F1)
+private val MedLensBackgroundBrush = Brush.verticalGradient(
+    colors = listOf(
+        Color(0xFFFFFBFF),
+        Color(0xFFF7FFFC),
+        Color(0xFFFFF8FD),
+    ),
+)
+private val MedLensSidebarBrush = Brush.verticalGradient(
+    colors = listOf(
+        Color(0xFFFAFDFF),
+        Color(0xFFF3FFF9),
+        Color(0xFFFFF7FE),
+    ),
+)
 private val URL_REGEX = Regex("""https?://[^\s)]+""")
 private const val MAX_PENDING_IMAGES = 3
