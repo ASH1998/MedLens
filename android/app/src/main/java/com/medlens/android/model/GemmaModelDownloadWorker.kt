@@ -23,12 +23,25 @@ class GemmaModelDownloadWorker(
         val modelsDir = File(applicationContext.filesDir, "models").apply { mkdirs() }
         val target = File(modelsDir, descriptor.fileName)
         val partial = File(modelsDir, descriptor.fileName + ".part")
+        val sidecar = File(modelsDir, descriptor.fileName + ".verified.json")
         Log.i(TAG, "Starting model download check for ${descriptor.fileName}")
 
-        if (target.exists() && target.length() == descriptor.sizeBytes && sha256(target) == descriptor.sha256) {
-            Log.i(TAG, "Model already present at ${target.absolutePath}")
-            return Result.success(outputData(target))
+        // If target exists with correct SHA, write sidecar and skip
+        if (target.exists() && target.length() == descriptor.sizeBytes) {
+            val actualSha = sha256(target)
+            if (actualSha == descriptor.sha256) {
+                writeSidecar(sidecar, descriptor, target.length())
+                Log.i(TAG, "Model already present and verified at ${target.absolutePath}")
+                return Result.success(outputData(target))
+            }
+            // Size matches but SHA is wrong — corrupt, delete and re-download
+            Log.w(TAG, "Existing model file is corrupt (SHA mismatch), deleting")
+            target.delete()
+            sidecar.delete()
         }
+
+        // Clean up any stale partial file
+        partial.delete()
 
         val requestBuilder = Request.Builder().url(descriptor.downloadUrl)
         if (BuildConfig.HF_ACCESS_TOKEN.isNotBlank()) {
@@ -66,14 +79,15 @@ class GemmaModelDownloadWorker(
         }
         val actualSha = sha256(partial)
         if (actualSha != descriptor.sha256) {
-            Log.e(TAG, "Model checksum mismatch")
+            Log.e(TAG, "Model checksum mismatch, expected=${descriptor.sha256}, actual=$actualSha")
             partial.delete()
             return Result.failure(Data.Builder().putString("error", "Model checksum mismatch").build())
         }
 
         if (target.exists()) target.delete()
         partial.renameTo(target)
-        Log.i(TAG, "Model download complete: ${target.absolutePath}")
+        writeSidecar(sidecar, descriptor, target.length())
+        Log.i(TAG, "Model download complete and verified: ${target.absolutePath}")
         return Result.success(outputData(target))
     }
 
@@ -105,6 +119,16 @@ class GemmaModelDownloadWorker(
             }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun writeSidecar(sidecarFile: File, descriptor: GemmaModelDescriptor, sizeBytes: Long) {
+        try {
+            sidecarFile.writeText(
+                """{"fileName":"${descriptor.fileName}","sha256":"${descriptor.sha256}","sizeBytes":$sizeBytes,"verifiedAt":${System.currentTimeMillis()}}""",
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to write sidecar: ${e.message}")
+        }
     }
 
     companion object {
