@@ -55,8 +55,8 @@ android {
         applicationId = "com.medlens.android"
         minSdk = 31
         targetSdk = 35
-        versionCode = 110
-        versionName = "v1.1.0"
+        versionCode = 111
+        versionName = "v1.1.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
