@@ -2,6 +2,7 @@ package com.medlens.android.data
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -15,6 +16,7 @@ private val Context.dataStore by preferencesDataStore(name = "medlens_android")
 private val CONVERSATIONS_KEY = stringPreferencesKey("conversations")
 private val ACTIVE_ID_KEY = stringPreferencesKey("active_conversation_id")
 private val LITERT_BACKEND_KEY = stringPreferencesKey("litert_backend")
+private val REMOTE_TTS_ENABLED_KEY = booleanPreferencesKey("remote_tts_enabled")
 
 enum class LiteRtBackendPref { CPU, GPU }
 
@@ -79,6 +81,17 @@ class ConversationStore(
     suspend fun saveBackendPref(pref: LiteRtBackendPref) {
         dataStore.edit { prefs ->
             prefs[LITERT_BACKEND_KEY] = pref.name
+        }
+    }
+
+    /** Observe the "remote TTS enabled" setting (default: false). */
+    val remoteTtsEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[REMOTE_TTS_ENABLED_KEY] ?: false
+    }
+
+    suspend fun saveRemoteTtsEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[REMOTE_TTS_ENABLED_KEY] = enabled
         }
     }
 
