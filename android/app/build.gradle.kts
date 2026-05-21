@@ -22,6 +22,21 @@ val hfAccessToken = providers.environmentVariable("HF_ACCESS_TOKEN")
         }
     })
     .get()
+val mimoApiKey = providers.environmentVariable("MIMO_API_KEY")
+    .orElse(providers.provider {
+        val envFile = rootProject.file("../.env")
+        if (!envFile.exists()) {
+            ""
+        } else {
+            envFile.readLines()
+                .firstOrNull { it.startsWith("MIMO_API_KEY=") }
+                ?.substringAfter("=")
+                ?.trim()
+                ?.removeSurrounding("\"")
+                ?: ""
+        }
+    })
+    .get()
 
 fun gradleStringLiteral(value: String): String = "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
@@ -55,10 +70,14 @@ android {
                 "HF_ACCESS_TOKEN",
                 gradleStringLiteral(if (enableDebugHfToken) hfAccessToken else ""),
             )
+            buildConfigField("String", "MIMO_API_KEY", gradleStringLiteral(mimoApiKey))
         }
         release {
+            // Secrets are intentionally empty for release builds — they are only
+            // injected from the environment / .env file for debug builds.
             isMinifyEnabled = false
             buildConfigField("String", "HF_ACCESS_TOKEN", "\"\"")
+            buildConfigField("String", "MIMO_API_KEY", "\"\"")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
