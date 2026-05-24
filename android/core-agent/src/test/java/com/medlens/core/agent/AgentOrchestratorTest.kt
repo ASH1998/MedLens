@@ -10,9 +10,14 @@ import com.medlens.core.data.model.CommonMedicineProfile
 import com.medlens.core.data.model.CommonMedicineRow
 import com.medlens.core.data.model.DrugInteractionList
 import com.medlens.core.data.model.EvidenceImportFile
+import com.medlens.core.data.model.FindPairsByEffectResult
+import com.medlens.core.data.model.ImportIssue
 import com.medlens.core.data.model.KnownInteraction
 import com.medlens.core.data.model.MedicationSafetyReport
 import com.medlens.core.data.model.NormalizedMedication
+import com.medlens.core.data.model.PairEffectsResult
+import com.medlens.core.data.model.RawDdiSignal
+import com.medlens.core.data.model.SeverityConsensusResult
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -260,6 +265,15 @@ private open class NoopSafetyRepository : SafetyRepository {
     ): List<CommonMedicineRow> = emptyList()
 
     override suspend fun listEvidenceSources(): List<EvidenceImportFile> = emptyList()
+    override suspend fun getPairEffects(drugA: String, drugB: String, limit: Int): PairEffectsResult =
+        PairEffectsResult(drug_a = drugA, drug_b = drugB, found = false, effects = emptyList())
+    override suspend fun getRawSignals(drugA: String, drugB: String, limit: Int): List<RawDdiSignal> = emptyList()
+    override suspend fun getFullRawSignals(drugA: String, drugB: String, limit: Int): List<RawDdiSignal> = emptyList()
+    override suspend fun severityConsensus(drugA: String, drugB: String): SeverityConsensusResult =
+        SeverityConsensusResult(drug_a = drugA, drug_b = drugB, found = false, rolled_up_severity = null, region_severities = emptyList())
+    override suspend fun findPairsByEffect(effect: String, limit: Int): FindPairsByEffectResult =
+        FindPairsByEffectResult(effect_query = effect, pairs = emptyList())
+    override suspend fun listImportIssues(sourceFile: String?, query: String?, limit: Int): List<ImportIssue> = emptyList()
     override fun close() = Unit
 }
 

@@ -146,3 +146,53 @@ data class DrugInteractionList(
     val normalized: NormalizedMedication,
     val interactions: List<KnownInteraction>,
 )
+
+@Serializable
+data class PairEffectsResult(
+    val drug_a: String,
+    val drug_b: String,
+    val found: Boolean,
+    val effects: List<InteractionEffect>,
+)
+
+@Serializable
+data class SeverityConsensusResult(
+    val drug_a: String,
+    val drug_b: String,
+    val found: Boolean,
+    val rolled_up_severity: String?,
+    val region_severities: List<RegionSeverity>,
+)
+
+@Serializable
+data class RegionSeverity(
+    val region: String,
+    val severity: String,
+    val row_count: Int,
+)
+
+@Serializable
+data class FindPairsByEffectResult(
+    val effect_query: String,
+    val pairs: List<EffectPairMatch>,
+)
+
+@Serializable
+data class EffectPairMatch(
+    val drug_a: String,
+    val drug_b: String,
+    val severity: String?,
+    val matching_effect: String,
+    val row_count: Int,
+)
+
+@Serializable
+data class ImportIssue(
+    val source_file: String,
+    val row_number: Int,
+    val drug1: String,
+    val drug2: String,
+    val normalized_drug1: String,
+    val normalized_drug2: String,
+    val reason: String,
+)

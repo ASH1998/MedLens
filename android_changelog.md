@@ -1,5 +1,43 @@
 # Android Changelog
 
+## v1.1.1 - 2026-05-21
+
+- Updated Android package metadata to `versionCode = 111` and
+  `versionName = "v1.1.1"`.
+- Added deterministic fallback path so typed medication checks work without
+  Gemma downloaded. The app parses medication candidates, builds a structured
+  safety report locally, and formats patient-facing text without the LLM.
+- Wired ML Kit OCR as the first-pass text extractor for camera images. Gemma
+  vision is now an optional fallback used only when ML Kit produces no useful
+  candidates and the model is downloaded.
+- Added 6 new repository APIs and tool schemas to match Python/web parity:
+  `get_pair_effects`, `get_raw_signals`, `get_full_raw_signals`,
+  `severity_consensus`, `find_pairs_by_effect`, `list_import_issues`.
+- Implemented SHA-256 verification before returning model `Ready` state. A
+  metadata sidecar (`.verified.json`) is written after successful verification
+  so startup no longer re-hashes the 3.66 GB model file on every launch.
+- Added retry path that deletes corrupt `.part` and target files before
+  re-downloading, and surfaces checksum failures as `ModelState.Error`.
+- Changed TTS to default to Android native `TextToSpeech`. Remote MiMo TTS is
+  now opt-in via a settings toggle and requires an API key.
+- Added "Requires internet (~3.66 GB)" label on the model download button.
+- Added evidence status badge (flagged interaction / no local finding /
+  unresolved / insufficient) before assistant message content.
+- Added resolved active-ingredient chips and unresolved medicine chips to
+  assistant messages so users can see what was actually checked.
+- Added collapsible sources section at the bottom of assistant messages.
+- Made the tool trace card debug-only (`BuildConfig.DEBUG`).
+- Added `FallbackReportFormatter` with 7 unit tests for flagged pair, no
+  finding, unresolved medicine, empty report, and duplicate ingredient cases.
+- Added `ToolParityTest` with 15 JVM tests covering normalization (Dolo to
+  acetaminophen, Clavam expansion), pair lookup (Advil plus Warfarin returns
+  Major), unresolved names in limitations, evidence source listing, import
+  issues, severity consensus, effect-based pair search, and session management.
+- Updated Android README with bundled asset list, OCR/image path documentation,
+  offline behavior, model integrity details, and Gradle build commands.
+- Added debug-only secret hygiene comment in `build.gradle.kts` documenting
+  that release `BuildConfig` secrets are intentionally empty.
+
 ## v1.1.0 - 2026-05-16
 
 - Updated Android package metadata to `versionCode = 110` and

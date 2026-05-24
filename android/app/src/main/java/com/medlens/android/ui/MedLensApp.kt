@@ -1,8 +1,17 @@
 package com.medlens.android.ui
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.media.MediaPlayer
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.util.Base64
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -35,20 +44,24 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Medication
 import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -63,6 +76,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -94,11 +108,24 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.medlens.android.BuildConfig
 import com.medlens.android.data.LiteRtBackendPref
 import com.medlens.android.data.PersistedConversation
+import com.medlens.core.data.model.MedicationSafetyReport
 import com.medlens.android.model.GEMMA_4_E4B_DESCRIPTOR
 import com.medlens.android.model.ModelState
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import org.json.JSONObject
 import java.io.File
+import java.io.IOException
+import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 @Composable
 fun MedLensApp(viewModel: MedLensViewModel) {
@@ -152,6 +179,19 @@ private fun ChatShell(
     var settingsOpen by remember { mutableStateOf(false) }
     var cameraOpen by rememberSaveable { mutableStateOf(false) }
     val uriHandler = LocalUriHandler.current
+    val context = LocalContext.current
+    var speakingMessageId by remember { mutableStateOf<String?>(null) }
+    val ttsController = remember(context.applicationContext) {
+        ChatTtsController(context.applicationContext) { speakingMessageId = it }
+    }
+
+    DisposableEffect(ttsController) {
+        onDispose { ttsController.shutdown() }
+    }
+
+    LaunchedEffect(state.remoteTtsEnabled) {
+        ttsController.remoteTtsEnabled = state.remoteTtsEnabled
+    }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val compact = maxWidth < 720.dp
@@ -205,16 +245,22 @@ private fun ChatShell(
                                 )
                             }
                         }
-                        items(activeConversation(state)?.messages ?: emptyList(), key = { it.id }) { message ->
+                        val messages = activeConversation(state)?.messages ?: emptyList()
+                        val lastAssistantIdx = messages.indexOfLast { it.role == "assistant" }
+                        itemsIndexed(messages, key = { _, msg -> msg.id }) { index, message ->
                             MessageBubble(
+                                messageId = message.id,
                                 role = message.role,
                                 content = message.content,
                                 pending = message.pending,
                                 imagePath = message.imagePath,
                                 imagePaths = message.imagePaths,
+                                speaking = speakingMessageId == message.id,
+                                onSpeak = ttsController::toggle,
+                                report = if (index == lastAssistantIdx) state.lastReport else null,
                             )
                         }
-                        if (state.trace.isNotEmpty()) {
+                        if (BuildConfig.DEBUG && state.trace.isNotEmpty()) {
                             item {
                                 ToolTraceCard(traceLines = state.trace.map { "${it.name} · ${it.duration_ms ?: 0} ms" })
                             }
@@ -324,8 +370,15 @@ private fun ChatShell(
                             color = MaterialTheme.colorScheme.error,
                         )
                     }
-                    Button(onClick = viewModel::enqueueModelDownload, enabled = state.modelState !is ModelState.Downloading) {
-                        Text("Download Gemma Model")
+                    Column {
+                        Button(onClick = viewModel::enqueueModelDownload, enabled = state.modelState !is ModelState.Downloading) {
+                            Text("Download Gemma Model")
+                        }
+                        Text(
+                            "Requires internet (~3.66 GB)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                     HorizontalDivider()
                     Text("How technical?", style = MaterialTheme.typography.titleSmall)
@@ -365,6 +418,26 @@ private fun ChatShell(
                             onClick = { viewModel.setBackendPref(LiteRtBackendPref.GPU) },
                         )
                         Text("GPU")
+                    }
+                    HorizontalDivider()
+                    Text("Privacy", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Remote TTS (MiMo API)")
+                            Text(
+                                "Sends text to a remote server for voice synthesis. Requires an API key.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = state.remoteTtsEnabled,
+                            onCheckedChange = { viewModel.setRemoteTtsEnabled(it) },
+                        )
                     }
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -886,11 +959,15 @@ private fun ModelStatusCard(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun MessageBubble(
+    messageId: String,
     role: String,
     content: String,
     pending: Boolean,
     imagePath: String?,
     imagePaths: List<String>,
+    speaking: Boolean,
+    onSpeak: (String, String) -> Unit,
+    report: MedicationSafetyReport? = null,
 ) {
     val isUser = role == "user"
     val uriHandler = LocalUriHandler.current
@@ -945,6 +1022,14 @@ private fun MessageBubble(
                 if (isUser && displayImagePaths.isNotEmpty()) {
                     MessageImageThumbnails(imagePaths = displayImagePaths)
                 }
+                // Evidence status badge (assistant messages with report)
+                if (!isUser && report != null && !pending) {
+                    EvidenceStatusBadge(report = report)
+                }
+                // Resolved active ingredients (chips before body)
+                if (!isUser && report != null && !pending) {
+                    ResolvedMedicineChips(report = report)
+                }
                 if (parsed.body.isNotBlank()) {
                     Text(
                         markdownBoldText(parsed.body),
@@ -952,15 +1037,29 @@ private fun MessageBubble(
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                 }
+                // Unresolved medicine chips (after body)
+                if (!isUser && report != null && !pending && report.unresolved_medications.isNotEmpty()) {
+                    UnresolvedMedicineChips(report = report)
+                }
+                // Collapsible sources section
                 if (!isUser && parsed.sources.isNotEmpty()) {
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    CollapsibleSources(sources = parsed.sources, uriHandler = uriHandler)
+                }
+                if (!isUser && !pending && parsed.body.isNotBlank()) {
+                    IconButton(
+                        onClick = { onSpeak(messageId, parsed.body) },
+                        modifier = Modifier
+                            .align(Alignment.End)
+                            .size(34.dp)
+                            .clip(CircleShape)
+                            .background(if (speaking) MedLensPurple.copy(alpha = 0.14f) else MedLensMint),
                     ) {
-                        Text("Sources:", style = MaterialTheme.typography.labelMedium)
-                        parsed.sources.forEach { source ->
-                            SourceReferenceText(source = source, onClick = { uriHandler.openUri(source.url) })
-                        }
+                        Icon(
+                            if (speaking) Icons.Outlined.Stop else Icons.AutoMirrored.Outlined.VolumeUp,
+                            contentDescription = if (speaking) "Stop reading message" else "Read message aloud",
+                            modifier = Modifier.size(18.dp),
+                            tint = if (speaking) MedLensPurple else MedLensNavy,
+                        )
                     }
                 }
             }
@@ -1037,6 +1136,167 @@ private fun SourceReferenceText(
 }
 
 @Composable
+private fun EvidenceStatusBadge(report: MedicationSafetyReport) {
+    val resolved = report.normalized_medications.filter { it.resolved }
+    val unresolved = report.unresolved_medications
+    val hasFindings = report.findings.isNotEmpty()
+    val hasCheckedPairs = report.checked_pair_count > 0
+    val insufficientMeds = resolved.size < 2
+
+    val (label, bgColor, fgColor) = when {
+        hasFindings -> Triple(
+            "Flagged interaction",
+            Color(0xFFFFF3E0),  // orange-50
+            Color(0xFFE65100),  // orange-900
+        )
+        unresolved.isNotEmpty() && resolved.isNotEmpty() -> Triple(
+            "Unresolved medicines",
+            Color(0xFFFFFDE7),  // yellow-50
+            Color(0xFFF57F17),  // yellow-900
+        )
+        hasCheckedPairs && !hasFindings -> Triple(
+            "No local flagged finding",
+            Color(0xFFE8F5E9),  // green-50
+            Color(0xFF2E7D32),  // green-800
+        )
+        insufficientMeds -> Triple(
+            "Insufficient medicines",
+            Color(0xFFF5F5F5),  // gray-100
+            Color(0xFF616161),  // gray-700
+        )
+        else -> return
+    }
+
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(bgColor)
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(7.dp)
+                .clip(CircleShape)
+                .background(fgColor),
+        )
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = fgColor,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ResolvedMedicineChips(report: MedicationSafetyReport) {
+    val resolved = report.normalized_medications
+        .filter { it.resolved }
+        .mapNotNull { it.canonical_name }
+        .distinct()
+    if (resolved.isEmpty()) return
+
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        resolved.forEach { name ->
+            Text(
+                text = name,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(MedLensMint)
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = MedLensTeal,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun UnresolvedMedicineChips(report: MedicationSafetyReport) {
+    val unresolved = report.unresolved_medications.map { it.input_name }.distinct()
+    if (unresolved.isEmpty()) return
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            "Could not identify:",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            unresolved.forEach { name ->
+                Text(
+                    text = name,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xFFFFF8E1))
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFFF57F17),
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CollapsibleSources(
+    sources: List<SourceReference>,
+    uriHandler: androidx.compose.ui.platform.UriHandler,
+) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 2.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Icon(
+                Icons.Outlined.Info,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "${sources.size} source${if (sources.size > 1) "s" else ""}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Icon(
+                if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                contentDescription = if (expanded) "Hide sources" else "Show sources",
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (expanded) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                sources.forEach { source ->
+                    SourceReferenceText(source = source, onClick = { uriHandler.openUri(source.url) })
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun ToolTraceCard(traceLines: List<String>) {
     var expanded by rememberSaveable { mutableStateOf(false) }
     Column(
@@ -1081,6 +1341,236 @@ private fun ToolTraceCard(traceLines: List<String>) {
         }
     }
 }
+
+private class ChatTtsController(
+    context: Context,
+    private val onSpeakingChanged: (String?) -> Unit,
+) : TextToSpeech.OnInitListener {
+    private val appContext = context.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(MIMO_TTS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .writeTimeout(MIMO_TTS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(MIMO_TTS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .callTimeout(MIMO_TTS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .build()
+    private val nativeTts = TextToSpeech(appContext, this)
+    private var nativeReady = false
+    /** When true (and API key is present), try MiMo remote TTS first. */
+    @Volatile var remoteTtsEnabled = false
+    @Volatile private var activeMessageId: String? = null
+    private var pendingSpeech: Pair<String, String>? = null
+    private var activeCall: Call? = null
+    private var mediaPlayer: MediaPlayer? = null
+    private var activeAudioFile: File? = null
+
+    init {
+        nativeTts.setOnUtteranceProgressListener(
+            object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {
+                    updateActive(utteranceId)
+                }
+
+                override fun onDone(utteranceId: String?) {
+                    clearIfActive(utteranceId)
+                }
+
+                @Deprecated("Deprecated in Android SDK")
+                override fun onError(utteranceId: String?) {
+                    clearIfActive(utteranceId)
+                }
+
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    clearIfActive(utteranceId)
+                }
+            },
+        )
+    }
+
+    override fun onInit(status: Int) {
+        if (status != TextToSpeech.SUCCESS) {
+            updateActive(null)
+            return
+        }
+        val defaultResult = nativeTts.setLanguage(Locale.getDefault())
+        if (defaultResult == TextToSpeech.LANG_MISSING_DATA || defaultResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+            nativeTts.setLanguage(Locale.US)
+        }
+        nativeTts.setSpeechRate(0.92f)
+        nativeReady = true
+        pendingSpeech?.let { (messageId, text) ->
+            pendingSpeech = null
+            speakNative(messageId, text)
+        }
+    }
+
+    fun toggle(messageId: String, text: String) {
+        if (activeMessageId == messageId) {
+            stop()
+        } else {
+            speak(messageId, text)
+        }
+    }
+
+    fun shutdown() {
+        pendingSpeech = null
+        stopActivePlayback()
+        nativeTts.shutdown()
+        updateActive(null)
+    }
+
+    private fun speak(messageId: String, text: String) {
+        val speech = text.toSpeechText()
+        if (speech.isBlank()) return
+        stopActivePlayback()
+        updateActive(messageId)
+
+        // Default to native TTS; only use remote MiMo TTS when the user explicitly opts in.
+        if (!remoteTtsEnabled || BuildConfig.MIMO_API_KEY.isBlank()) {
+            speakNative(messageId, speech)
+            return
+        }
+
+        val request = Request.Builder()
+            .url(MIMO_TTS_URL)
+            .header("Authorization", "Bearer ${BuildConfig.MIMO_API_KEY}")
+            .header("Content-Type", "application/json")
+            .post(mimoPayload(speech).toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        activeCall = httpClient.newCall(request).also { call ->
+            call.enqueue(
+                object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        Log.w("MedLens", "MiMo TTS failed; falling back to native TTS: ${e.message}")
+                        mainHandler.post {
+                            if (activeMessageId == messageId) speakNative(messageId, speech)
+                        }
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        response.use {
+                            val raw = it.body?.string().orEmpty()
+                            if (!it.isSuccessful) {
+                                Log.w("MedLens", "MiMo TTS HTTP ${it.code}; falling back to native TTS")
+                                mainHandler.post {
+                                    if (activeMessageId == messageId) speakNative(messageId, speech)
+                                }
+                                return
+                            }
+                            runCatching {
+                                val audioBase64 = JSONObject(raw)
+                                    .getJSONArray("choices")
+                                    .getJSONObject(0)
+                                    .getJSONObject("message")
+                                    .getJSONObject("audio")
+                                    .getString("data")
+                                val audioFile = File.createTempFile("medlens-mimo-", ".wav", appContext.cacheDir)
+                                audioFile.writeBytes(Base64.decode(audioBase64, Base64.DEFAULT))
+                                mainHandler.post {
+                                    if (activeMessageId == messageId) playAudioFile(messageId, audioFile) else audioFile.delete()
+                                }
+                            }.onFailure { error ->
+                                Log.w("MedLens", "MiMo TTS parse/play failed; falling back to native TTS: ${error.message}")
+                                mainHandler.post {
+                                    if (activeMessageId == messageId) speakNative(messageId, speech)
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+        }
+    }
+
+    private fun speakNative(messageId: String, speech: String) {
+        if (!nativeReady) {
+            pendingSpeech = messageId to speech
+            updateActive(messageId)
+            return
+        }
+        mediaPlayer?.release()
+        mediaPlayer = null
+        nativeTts.stop()
+        updateActive(messageId)
+        nativeTts.speak(speech, TextToSpeech.QUEUE_FLUSH, Bundle(), messageId)
+    }
+
+    private fun playAudioFile(messageId: String, audioFile: File) {
+        nativeTts.stop()
+        mediaPlayer?.release()
+        activeAudioFile?.delete()
+        activeAudioFile = audioFile
+        mediaPlayer = MediaPlayer().apply {
+            setDataSource(audioFile.absolutePath)
+            setOnCompletionListener {
+                releasePlayer()
+                clearIfActive(messageId)
+            }
+            setOnErrorListener { _, _, _ ->
+                releasePlayer()
+                clearIfActive(messageId)
+                true
+            }
+            prepare()
+            start()
+        }
+    }
+
+    private fun stop() {
+        pendingSpeech = null
+        stopActivePlayback()
+        updateActive(null)
+    }
+
+    private fun stopActivePlayback() {
+        activeCall?.cancel()
+        activeCall = null
+        nativeTts.stop()
+        releasePlayer()
+    }
+
+    private fun releasePlayer() {
+        mediaPlayer?.release()
+        mediaPlayer = null
+        activeAudioFile?.delete()
+        activeAudioFile = null
+    }
+
+    private fun clearIfActive(utteranceId: String?) {
+        if (utteranceId == null || utteranceId == activeMessageId) {
+            updateActive(null)
+        }
+    }
+
+    private fun updateActive(messageId: String?) {
+        activeMessageId = messageId
+        mainHandler.post { onSpeakingChanged(messageId) }
+    }
+
+    private fun mimoPayload(text: String): String =
+        JSONObject()
+            .put("model", "mimo-v2.5-tts")
+            .put(
+                "messages",
+                org.json.JSONArray()
+                    .put(JSONObject().put("role", "user").put("content", MIMO_TTS_STYLE))
+                    .put(JSONObject().put("role", "assistant").put("content", text.take(MIMO_TTS_MAX_CHARS))),
+            )
+            .put(
+                "audio",
+                JSONObject()
+                    .put("format", "wav")
+                    .put("voice", MIMO_TTS_VOICE),
+            )
+            .toString()
+}
+
+private fun String.toSpeechText(): String =
+    replace(URL_REGEX, "")
+        .replace(Regex("""\*\*(.*?)\*\*"""), "$1")
+        .replace(Regex("""(?m)^\s*[-*]\s+"""), "")
+        .replace(Regex("""\s+"""), " ")
+        .trim()
 
 private fun activeConversation(state: MedLensUiState): PersistedConversation? =
     state.conversations.firstOrNull { it.id == state.activeConversationId }
@@ -1163,4 +1653,10 @@ private val MedLensSidebarBrush = Brush.verticalGradient(
     ),
 )
 private val URL_REGEX = Regex("""https?://[^\s)]+""")
+private val JSON_MEDIA_TYPE = "application/json".toMediaType()
+private const val MIMO_TTS_URL = "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions"
+private const val MIMO_TTS_VOICE = "Dean"
+private const val MIMO_TTS_STYLE = "Use a calm, professional narrator voice. Speak normally with clear pauses."
+private const val MIMO_TTS_TIMEOUT_SECONDS = 90L
+private const val MIMO_TTS_MAX_CHARS = 3_500
 private const val MAX_PENDING_IMAGES = 3

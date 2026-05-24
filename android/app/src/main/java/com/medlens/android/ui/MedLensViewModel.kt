@@ -12,7 +12,9 @@ import com.medlens.android.litert.LiteRtBackendChoice
 import com.medlens.android.litert.LiteRtLmProvider
 import com.medlens.android.model.GemmaModelManager
 import com.medlens.android.model.ModelState
+import com.medlens.android.ocr.MlKitOcrManager
 import com.medlens.core.agent.AgentOrchestrator
+import com.medlens.core.agent.FallbackReportFormatter
 import com.medlens.core.agent.ToolDispatcher
 import com.medlens.core.agent.model.AgentMessage
 import com.medlens.core.agent.model.ChatSession
@@ -43,10 +45,12 @@ data class MedLensUiState(
     val activeConversationId: String = "",
     val busy: Boolean = false,
     val trace: List<ToolCallRecord> = emptyList(),
+    val lastReport: com.medlens.core.data.model.MedicationSafetyReport? = null,
     val modelState: ModelState = ModelState.NotDownloaded,
     val providerLabel: String = "Gemma not ready",
     val backendPref: LiteRtBackendPref = LiteRtBackendPref.CPU,
     val audienceStyle: AudienceStyle = AudienceStyle.Regular,
+    val remoteTtsEnabled: Boolean = false,
 )
 
 enum class AudienceStyle {
@@ -62,6 +66,7 @@ class MedLensViewModel(
     private val conversationStore = ConversationStore(appContext)
     private val installer = DatabaseInstaller(appContext)
     private val modelManager = GemmaModelManager(appContext)
+    private val mlKitOcr = MlKitOcrManager()
     private val session = ChatSession()
 
     private var repository: SafetyRepository? = null
@@ -96,7 +101,7 @@ class MedLensViewModel(
                     liteRtProvider?.close()
                     liteRtProvider = null
                 }
-                _uiState.update { it.copy(modelState = state, providerLabel = if (state is ModelState.Ready) "LiteRT-LM (${currentBackend.name})" else "Gemma not ready") }
+                _uiState.update { it.copy(modelState = state, providerLabel = if (state is ModelState.Ready) "LiteRT-LM (${currentBackend.name})" else "Local (deterministic)") }
             }
         }
         viewModelScope.launch {
@@ -113,6 +118,11 @@ class MedLensViewModel(
                         providerLabel = if (state.modelState is ModelState.Ready) "LiteRT-LM (${pref.name})" else state.providerLabel,
                     )
                 }
+            }
+        }
+        viewModelScope.launch {
+            conversationStore.remoteTtsEnabled.collect { enabled ->
+                _uiState.update { it.copy(remoteTtsEnabled = enabled) }
             }
         }
         bootstrap()
@@ -152,15 +162,6 @@ class MedLensViewModel(
             Log.e("MedLens", "VM.sendMessage no repository ready")
             return
         }
-        val provider = liteRtProvider ?: run {
-            Log.e("MedLens", "VM.sendMessage no liteRtProvider ready")
-            return
-        }
-        val orchestrator = AgentOrchestrator(
-            dispatcher = ToolDispatcher(repo),
-            provider = provider,
-            repository = repo,
-        )
         val current = activeConversation() ?: return
         val assistantId = java.util.UUID.randomUUID().toString()
 
@@ -176,32 +177,59 @@ class MedLensViewModel(
                 ),
             )
 
-            runCatching {
-                orchestrator.runTurn(session, message, audiencePrompt = _uiState.value.audienceStyle.prompt())
-            }.onSuccess { result ->
-                Log.i("MedLens", "VM.sendMessage SUCCESS tools=${result.usedTools} finalText=${result.finalText.length} chars")
+            val provider = liteRtProvider
+            if (provider != null) {
+                // Model is ready — use full agent loop
+                val orchestrator = AgentOrchestrator(
+                    dispatcher = ToolDispatcher(repo),
+                    provider = provider,
+                    repository = repo,
+                )
+                runCatching {
+                    orchestrator.runTurn(session, message, audiencePrompt = _uiState.value.audienceStyle.prompt())
+                }.onSuccess { result ->
+                    Log.i("MedLens", "VM.sendMessage SUCCESS tools=${result.usedTools} finalText=${result.finalText.length} chars")
+                    val active = activeConversation()
+                    val updatedConversation = active?.copy(
+                        messages = active.messages.map {
+                            if (it.id == assistantId) it.copy(content = result.finalText, pending = false) else it
+                        },
+                        medications = session.medicationInputs(),
+                        updatedAt = System.currentTimeMillis(),
+                    )
+                    if (updatedConversation != null) saveConversation(updatedConversation)
+                    _uiState.update { it.copy(trace = result.trace, lastReport = result.report, busy = false) }
+                }.onFailure { error ->
+                    Log.e("MedLens", "VM.sendMessage runTurn threw ${error::class.java.simpleName}: ${error.message}", error)
+                    val active = activeConversation()
+                    val failureText = turnFailureMessage(error)
+                    val updatedConversation = active?.copy(
+                        messages = active.messages.map {
+                            if (it.id == assistantId) it.copy(content = failureText, pending = false) else it
+                        },
+                        updatedAt = System.currentTimeMillis(),
+                    )
+                    if (updatedConversation != null) saveConversation(updatedConversation)
+                    _uiState.update { it.copy(busy = false) }
+                }
+            } else {
+                // Model not ready — use deterministic fallback
+                Log.i("MedLens", "VM.sendMessage using deterministic fallback (model not ready)")
+                val fallbackText = runCatching {
+                    runDeterministicFallback(repo, message)
+                }.getOrElse { error ->
+                    Log.e("MedLens", "VM.sendMessage fallback failed: ${error.message}", error)
+                    "I couldn't check that right now. Please try again, or download the model for full explanations."
+                }
                 val active = activeConversation()
                 val updatedConversation = active?.copy(
                     messages = active.messages.map {
-                        if (it.id == assistantId) it.copy(content = result.finalText, pending = false) else it
-                    },
-                    medications = session.medicationInputs(),
-                    updatedAt = System.currentTimeMillis(),
-                )
-                if (updatedConversation != null) saveConversation(updatedConversation)
-                _uiState.update { it.copy(trace = result.trace, busy = false) }
-            }.onFailure { error ->
-                Log.e("MedLens", "VM.sendMessage runTurn threw ${error::class.java.simpleName}: ${error.message}", error)
-                val active = activeConversation()
-                val failureText = turnFailureMessage(error)
-                val updatedConversation = active?.copy(
-                    messages = active.messages.map {
-                        if (it.id == assistantId) it.copy(content = failureText, pending = false) else it
+                        if (it.id == assistantId) it.copy(content = fallbackText, pending = false) else it
                     },
                     updatedAt = System.currentTimeMillis(),
                 )
                 if (updatedConversation != null) saveConversation(updatedConversation)
-                _uiState.update { it.copy(busy = false) }
+                _uiState.update { it.copy(lastReport = session.lastReport, busy = false) }
             }
         }
     }
@@ -225,15 +253,6 @@ class MedLensViewModel(
             Log.e("MedLens", "VM.sendImageMessage no repository ready")
             return
         }
-        val provider = liteRtProvider ?: run {
-            Log.e("MedLens", "VM.sendImageMessage no liteRtProvider ready")
-            return
-        }
-        val orchestrator = AgentOrchestrator(
-            dispatcher = ToolDispatcher(repo),
-            provider = provider,
-            repository = repo,
-        )
         val current = activeConversation() ?: return
         val displayText = userText.trim()
         val titleText = displayText.ifBlank { "Image attached" }
@@ -258,37 +277,110 @@ class MedLensViewModel(
             )
 
             runCatching {
-                val extractedParts = safeImagePaths.mapIndexed { index, imagePath ->
-                    Log.i("MedLens", "VM image[${index + 1}/${safeImagePaths.size}] OCR start: $imagePath")
-                    val text = provider.extractMedicineCandidatesFromImage(imagePath, userText)
-                    Log.i("MedLens", "VM image[${index + 1}] OCR done (${text.length} chars)")
-                    "Image ${index + 1}:\n${text.trim()}"
-                }.filter { it.isNotBlank() }
-                val extracted = extractedParts.joinToString("\n\n")
-                if (extracted.isBlank()) error("No visible medicine text was extracted from the attached image.")
-                val candidatesFromExtraction = medicationCandidatesFromExtraction(extracted)
+                // Step 1: ML Kit OCR first (deterministic, offline)
+                val mlKitCandidates = mutableListOf<String>()
+                val mlKitRawTexts = mutableListOf<String>()
+                for ((index, imagePath) in safeImagePaths.withIndex()) {
+                    Log.i("MedLens", "VM image[${index + 1}/${safeImagePaths.size}] ML Kit OCR start: $imagePath")
+                    val candidates = mlKitOcr.recognizeCandidatesFromFile(appContext, imagePath)
+                    val rawText = mlKitOcr.recognizeRawText(appContext, imagePath)
+                    Log.i("MedLens", "VM image[${index + 1}] ML Kit OCR done: ${candidates.size} candidates, ${rawText.length} raw chars")
+                    mlKitCandidates.addAll(candidates)
+                    if (rawText.isNotBlank()) mlKitRawTexts.add("Image ${index + 1}:\n${rawText.trim()}")
+                }
+                val mlKitDistinct = mlKitCandidates.distinct().take(12)
+                Log.i("MedLens", "VM ML Kit candidates: $mlKitDistinct")
+
+                // Step 2: Determine OCR text and candidates
+                var ocrText = mlKitRawTexts.joinToString("\n\n")
+                var allCandidates = medicationCandidatesFromExtraction(ocrText)
+                    .ifEmpty { mlKitDistinct }
                 val candidatesFromUserText = medicationCandidatesFromUserText(userText)
-                Log.i("MedLens", "VM candidates from images: $candidatesFromExtraction")
-                Log.i("MedLens", "VM candidates from user text: $candidatesFromUserText")
-                val candidates = (candidatesFromExtraction + candidatesFromUserText)
+
+                // Step 3: If ML Kit produced nothing useful AND model is ready, try Gemma vision
+                if (allCandidates.isEmpty() && liteRtProvider != null) {
+                    Log.i("MedLens", "VM ML Kit produced no candidates, trying Gemma vision fallback")
+                    val visionProvider = liteRtProvider!!
+                    val visionParts = safeImagePaths.mapIndexed { index, imagePath ->
+                        Log.i("MedLens", "VM image[${index + 1}] Gemma vision start: $imagePath")
+                        val text = visionProvider.extractMedicineCandidatesFromImage(imagePath, userText)
+                        Log.i("MedLens", "VM image[${index + 1}] Gemma vision done (${text.length} chars)")
+                        "Image ${index + 1}:\n${text.trim()}"
+                    }.filter { it.isNotBlank() }
+                    ocrText = visionParts.joinToString("\n\n")
+                    allCandidates = medicationCandidatesFromExtraction(ocrText)
+                }
+
+                if (ocrText.isBlank() && allCandidates.isEmpty()) {
+                    error("No visible medicine text was extracted from the attached image.")
+                }
+
+                val candidates = (allCandidates + candidatesFromUserText)
                     .distinctBy { it.lowercase() }
                     .take(8)
                 Log.i("MedLens", "VM combined candidates (final): $candidates")
-                val agentMessage = imageAgentMessage(extracted, candidates, userText)
-                Log.i("MedLens", "VM handing off to orchestrator (agentMessage ${agentMessage.length} chars)")
-                orchestrator.runTurn(session, agentMessage, audiencePrompt = _uiState.value.audienceStyle.prompt())
+
+                val provider = liteRtProvider
+                if (provider != null) {
+                    // Model is ready — use full agent loop
+                    val orchestrator = AgentOrchestrator(
+                        dispatcher = ToolDispatcher(repo),
+                        provider = provider,
+                        repository = repo,
+                    )
+                    val agentMessage = imageAgentMessage(ocrText, candidates, userText)
+                    Log.i("MedLens", "VM handing off to orchestrator (agentMessage ${agentMessage.length} chars)")
+                    orchestrator.runTurn(session, agentMessage, audiencePrompt = _uiState.value.audienceStyle.prompt())
+                } else {
+                    // Model not ready — use deterministic fallback with OCR candidates
+                    Log.i("MedLens", "VM using deterministic fallback for image (model not ready)")
+                    if (candidates.size >= 2) {
+                        val report = repo.buildStructuredReport(candidates)
+                        session.lastReport = report
+                        mergeResolvedMedications(session, report.normalized_medications)
+                        FallbackReportFormatter.format(report)
+                            ?: "I couldn't produce a safety report from the visible medicines. Please type the active ingredient names."
+                    } else if (candidates.size == 1) {
+                        val normalized = repo.normalizeMedications(candidates)
+                        val resolved = normalized.filter { it.resolved }
+                        if (resolved.isNotEmpty()) {
+                            val interactions = repo.listInteractionsForDrug(resolved.first().canonical_name!!, limit = 5)
+                            val lines = mutableListOf<String>()
+                            lines += "I identified: ${resolved.first().canonical_name}."
+                            if (interactions.interactions.isNotEmpty()) {
+                                lines += "Known interactions include:"
+                                for (interaction in interactions.interactions.take(5)) {
+                                    val severity = interaction.severity ?: "flagged"
+                                    val partner = if (interaction.drug_a.equals(resolved.first().canonical_name, ignoreCase = true))
+                                        interaction.drug_b else interaction.drug_a
+                                    lines += "• $partner — $severity"
+                                }
+                            } else {
+                                lines += "No flagged interactions found in the local evidence."
+                            }
+                            lines += "This is a local evidence check, not medical advice. Consult your doctor or pharmacist."
+                            lines.joinToString("\n\n")
+                        } else {
+                            "I saw '${candidates.first()}' in the image but couldn't match it to a known medicine. Please type the active ingredient name."
+                        }
+                    } else {
+                        "I couldn't identify medicine names from the image. Please try a clearer photo, or type the medicine names directly."
+                    }
+                }
             }.onSuccess { result ->
-                Log.i("MedLens", "VM.sendImageMessage SUCCESS tools=${result.usedTools} finalText=${result.finalText.length} chars")
+                val resultText = if (result is String) result else (result as? com.medlens.core.agent.model.AgentTurnResult)?.finalText ?: result.toString()
+                val trace = (result as? com.medlens.core.agent.model.AgentTurnResult)?.trace ?: emptyList()
+                Log.i("MedLens", "VM.sendImageMessage SUCCESS resultText=${resultText.length} chars")
                 val active = activeConversation()
                 val updatedConversation = active?.copy(
                     messages = active.messages.map {
-                        if (it.id == assistantId) it.copy(content = result.finalText, pending = false) else it
+                        if (it.id == assistantId) it.copy(content = resultText, pending = false) else it
                     },
                     medications = session.medicationInputs(),
                     updatedAt = System.currentTimeMillis(),
                 )
                 if (updatedConversation != null) saveConversation(updatedConversation)
-                _uiState.update { it.copy(trace = result.trace, busy = false) }
+                _uiState.update { it.copy(trace = trace, lastReport = session.lastReport, busy = false) }
             }.onFailure { error ->
                 Log.e("MedLens", "VM.sendImageMessage failed: ${error::class.java.simpleName}: ${error.message}", error)
                 val active = activeConversation()
@@ -300,7 +392,7 @@ class MedLensViewModel(
                     updatedAt = System.currentTimeMillis(),
                 )
                 if (updatedConversation != null) saveConversation(updatedConversation)
-                _uiState.update { it.copy(busy = false) }
+                _uiState.update { it.copy(lastReport = null, busy = false) }
             }
         }
     }
@@ -344,6 +436,11 @@ class MedLensViewModel(
 
     fun setAudienceStyle(style: AudienceStyle) {
         _uiState.update { it.copy(audienceStyle = style) }
+    }
+
+    fun setRemoteTtsEnabled(enabled: Boolean) {
+        _uiState.update { it.copy(remoteTtsEnabled = enabled) }
+        viewModelScope.launch { conversationStore.saveRemoteTtsEnabled(enabled) }
     }
 
     override fun onCleared() {
@@ -490,6 +587,61 @@ class MedLensViewModel(
         return simplified.takeIf { it.length >= 3 && !it.equals(value, ignoreCase = true) }
     }
 
+    /**
+     * Deterministic fallback path: parse medication candidates from user text,
+     * build a structured report, and format it as patient-facing text without
+     * requiring the LLM model.
+     */
+    private fun runDeterministicFallback(repo: SafetyRepository, message: String): String {
+        val candidates = medicationCandidatesFromUserText(message)
+            .ifEmpty {
+                // Try simpler pattern: just split on common separators
+                message.replace(Regex("\\s+"), " ").trim()
+                    .split(Regex("[,;+]"))
+                    .map { it.trim() }
+                    .filter { it.length in 2..60 && it.any { c -> c.isLetter() } }
+                    .take(6)
+            }
+        Log.i("MedLens", "Fallback candidates: $candidates")
+
+        if (candidates.isEmpty()) {
+            return "I couldn't identify medicine names from your message. Please type the medicine names you'd like to check (e.g., 'Advil and Warfarin')."
+        }
+
+        if (candidates.size < 2) {
+            // Single medicine — list interactions
+            val normalized = repo.normalizeMedications(candidates)
+            val resolved = normalized.filter { it.resolved }
+            if (resolved.isEmpty()) {
+                return FallbackReportFormatter.formatUnresolved(candidates)
+            }
+            val interactions = repo.listInteractionsForDrug(resolved.first().canonical_name!!, limit = 5)
+            val lines = mutableListOf<String>()
+            lines += "I identified: ${resolved.first().canonical_name}."
+            if (interactions.interactions.isNotEmpty()) {
+                lines += "Known interactions include:"
+                for (interaction in interactions.interactions.take(5)) {
+                    val severity = interaction.severity ?: "flagged"
+                    val partner = if (interaction.drug_a.equals(resolved.first().canonical_name, ignoreCase = true))
+                        interaction.drug_b else interaction.drug_a
+                    lines += "• $partner — $severity"
+                }
+            } else {
+                lines += "No flagged interactions found in the local evidence for this medicine."
+            }
+            lines += "This is a local evidence check, not medical advice. Consult your doctor or pharmacist."
+            return lines.joinToString("\n\n")
+        }
+
+        // Two or more medicines — build structured report
+        val report = repo.buildStructuredReport(candidates)
+        session.lastReport = report
+        mergeResolvedMedications(session, report.normalized_medications)
+
+        return FallbackReportFormatter.format(report)
+            ?: "I couldn't produce a safety report from those names. Please try typing the active ingredient names."
+    }
+
     private fun turnFailureMessage(error: Throwable): String =
         "I had trouble checking that just now. Please try again, or type the medicine names directly."
 
@@ -508,6 +660,7 @@ class MedLensViewModel(
         repository?.let { repo ->
             session.medications += repo.normalizeMedications(conversation.medications)
         }
+        _uiState.update { it.copy(lastReport = null, trace = emptyList()) }
     }
 }
 

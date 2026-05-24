@@ -118,6 +118,75 @@ val TOOL_SCHEMAS: List<ToolSchema> = listOf(
         ),
     ),
     ToolSchema("list_evidence_sources", "List DDI source files loaded into the evidence artifact.", objectSchema()),
+    ToolSchema(
+        "get_pair_effects",
+        "Get adverse effects for a local DDI reference pair.",
+        objectSchema(
+            """
+            "drug_a": {"type": "string"},
+            "drug_b": {"type": "string"},
+            "limit": {"type": "integer"}
+            """.trimIndent(),
+            required = listOf("drug_a", "drug_b"),
+        ),
+    ),
+    ToolSchema(
+        "get_raw_signals",
+        "Get raw supporting DDI signal rows for a pair.",
+        objectSchema(
+            """
+            "drug_a": {"type": "string"},
+            "drug_b": {"type": "string"},
+            "limit": {"type": "integer"}
+            """.trimIndent(),
+            required = listOf("drug_a", "drug_b"),
+        ),
+    ),
+    ToolSchema(
+        "get_full_raw_signals",
+        "Get full raw supporting DDI signal rows for a pair, including source file, source row, mechanism, flags, and source URLs.",
+        objectSchema(
+            """
+            "drug_a": {"type": "string"},
+            "drug_b": {"type": "string"},
+            "limit": {"type": "integer"}
+            """.trimIndent(),
+            required = listOf("drug_a", "drug_b"),
+        ),
+    ),
+    ToolSchema(
+        "severity_consensus",
+        "Return per-region severity and rolled-up severity for a pair.",
+        objectSchema(
+            """
+            "drug_a": {"type": "string"},
+            "drug_b": {"type": "string"}
+            """.trimIndent(),
+            required = listOf("drug_a", "drug_b"),
+        ),
+    ),
+    ToolSchema(
+        "find_pairs_by_effect",
+        "Find pairs with effects matching a query.",
+        objectSchema(
+            """
+            "effect": {"type": "string"},
+            "limit": {"type": "integer"}
+            """.trimIndent(),
+            required = listOf("effect"),
+        ),
+    ),
+    ToolSchema(
+        "list_import_issues",
+        "List unresolved DDI import rows for artifact/debug review.",
+        objectSchema(
+            """
+            "source_file": {"type": "string"},
+            "query": {"type": "string"},
+            "limit": {"type": "integer"}
+            """.trimIndent(),
+        ),
+    ),
     ToolSchema("current_session_summary", "Return provider and session summary.", objectSchema()),
     ToolSchema(
         "evidence_about",
@@ -297,6 +366,46 @@ class ToolDispatcher(
         "evidence_about" -> mapOf(
             "text" to "MedLens grounds medication safety answers in curated interaction evidence. Severity and sources come directly from the checked evidence.",
         )
+        "get_pair_effects" -> {
+            mapOf("json" to json.encodeToString(store.getPairEffects(
+                drugA = args["drug_a"].orEmpty(),
+                drugB = args["drug_b"].orEmpty(),
+                limit = args["limit"]?.toIntOrNull() ?: 10,
+            )))
+        }
+        "get_raw_signals" -> {
+            mapOf("json" to json.encodeToString(store.getRawSignals(
+                drugA = args["drug_a"].orEmpty(),
+                drugB = args["drug_b"].orEmpty(),
+                limit = args["limit"]?.toIntOrNull() ?: 20,
+            )))
+        }
+        "get_full_raw_signals" -> {
+            mapOf("json" to json.encodeToString(store.getFullRawSignals(
+                drugA = args["drug_a"].orEmpty(),
+                drugB = args["drug_b"].orEmpty(),
+                limit = args["limit"]?.toIntOrNull() ?: 20,
+            )))
+        }
+        "severity_consensus" -> {
+            mapOf("json" to json.encodeToString(store.severityConsensus(
+                drugA = args["drug_a"].orEmpty(),
+                drugB = args["drug_b"].orEmpty(),
+            )))
+        }
+        "find_pairs_by_effect" -> {
+            mapOf("json" to json.encodeToString(store.findPairsByEffect(
+                effect = args["effect"].orEmpty(),
+                limit = args["limit"]?.toIntOrNull() ?: 10,
+            )))
+        }
+        "list_import_issues" -> {
+            mapOf("json" to json.encodeToString(store.listImportIssues(
+                sourceFile = args["source_file"],
+                query = args["query"],
+                limit = args["limit"]?.toIntOrNull() ?: 20,
+            )))
+        }
         else -> mapOf("error" to "Tool not yet ported in Android scaffold: $name")
     }
 

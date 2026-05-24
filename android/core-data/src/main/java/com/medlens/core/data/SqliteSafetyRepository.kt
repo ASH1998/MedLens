@@ -7,13 +7,19 @@ import com.medlens.core.data.model.CommonMedicineProfile
 import com.medlens.core.data.model.CommonMedicineRow
 import com.medlens.core.data.model.DuplicateIngredientWarning
 import com.medlens.core.data.model.DrugInteractionList
+import com.medlens.core.data.model.EffectPairMatch
 import com.medlens.core.data.model.EvidenceImportFile
+import com.medlens.core.data.model.FindPairsByEffectResult
+import com.medlens.core.data.model.ImportIssue
 import com.medlens.core.data.model.InteractionEffect
 import com.medlens.core.data.model.KnownInteraction
 import com.medlens.core.data.model.MedicationSafetyReport
 import com.medlens.core.data.model.NormalizedMedication
+import com.medlens.core.data.model.PairEffectsResult
 import com.medlens.core.data.model.PracticalGuidance
 import com.medlens.core.data.model.RawDdiSignal
+import com.medlens.core.data.model.RegionSeverity
+import com.medlens.core.data.model.SeverityConsensusResult
 import com.medlens.core.data.util.normalizeLookupText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -650,6 +656,223 @@ class SqliteSafetyRepository(
                             rows_imported = cursor.int("rows_imported"),
                             rows_unresolved = cursor.int("rows_unresolved"),
                             unique_pairs_imported = cursor.int("unique_pairs_imported"),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    override suspend fun getPairEffects(
+        drugA: String,
+        drugB: String,
+        limit: Int,
+    ): PairEffectsResult = withContext(Dispatchers.IO) {
+        val interaction = lookupKnownInteraction(drugA, drugB, effectLimit = max(1, limit))
+        PairEffectsResult(
+            drug_a = interaction.drug_a,
+            drug_b = interaction.drug_b,
+            found = interaction.found,
+            effects = interaction.effects,
+        )
+    }
+
+    override suspend fun getRawSignals(
+        drugA: String,
+        drugB: String,
+        limit: Int,
+    ): List<RawDdiSignal> = withContext(Dispatchers.IO) {
+        val interaction = lookupKnownInteraction(drugA, drugB, effectLimit = 3, rawSignalLimit = max(1, limit))
+        interaction.raw_signals
+    }
+
+    override suspend fun getFullRawSignals(
+        drugA: String,
+        drugB: String,
+        limit: Int,
+    ): List<RawDdiSignal> = withContext(Dispatchers.IO) {
+        val interaction = lookupKnownInteraction(drugA, drugB, effectLimit = 3, rawSignalLimit = max(1, limit))
+        interaction.raw_signals
+    }
+
+    override suspend fun severityConsensus(
+        drugA: String,
+        drugB: String,
+    ): SeverityConsensusResult = withContext(Dispatchers.IO) {
+        val db = evidenceDb()
+        val normalizedA = normalizeMedications(listOf(drugA)).filter { it.resolved && it.canonical_name != null }
+        val normalizedB = normalizeMedications(listOf(drugB)).filter { it.resolved && it.canonical_name != null }
+        if (normalizedA.isEmpty() || normalizedB.isEmpty()) {
+            val sorted = listOf(normalizeLookupText(drugA), normalizeLookupText(drugB)).sorted()
+            return@withContext SeverityConsensusResult(
+                drug_a = sorted[0],
+                drug_b = sorted[1],
+                found = false,
+                rolled_up_severity = null,
+                region_severities = emptyList(),
+            )
+        }
+
+        var foundInteractionId: Long? = null
+        var foundDrugA = ""
+        var foundDrugB = ""
+        var foundSeverity: String? = null
+        for (left in normalizedA) {
+            for (right in normalizedB) {
+                if (left.canonical_name == right.canonical_name) continue
+                val sorted = listOf(left.canonical_name, right.canonical_name).filterNotNull().sorted()
+                db.rawQuery(
+                    "SELECT * FROM known_interaction WHERE drug_a = ? AND drug_b = ?",
+                    arrayOf(sorted[0], sorted[1]),
+                ).use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        foundInteractionId = cursor.long("id")
+                        foundDrugA = cursor.string("drug_a")
+                        foundDrugB = cursor.string("drug_b")
+                        foundSeverity = cursor.string("severity")
+                    }
+                }
+                if (foundInteractionId != null) break
+            }
+            if (foundInteractionId != null) break
+        }
+
+        if (foundInteractionId == null) {
+            val sorted = listOf(
+                normalizedA.first().canonical_name ?: normalizeLookupText(drugA),
+                normalizedB.first().canonical_name ?: normalizeLookupText(drugB),
+            ).sorted()
+            return@withContext SeverityConsensusResult(
+                drug_a = sorted[0],
+                drug_b = sorted[1],
+                found = false,
+                rolled_up_severity = null,
+                region_severities = emptyList(),
+            )
+        }
+
+        // Query effects for per-region severity
+        db.rawQuery(
+            """
+            SELECT adverse_effect, severity, source_regions_json
+            FROM known_interaction_effect
+            WHERE known_interaction_id = ?
+            ORDER BY severity_rank DESC, row_count DESC
+            """,
+            arrayOf(foundInteractionId.toString()),
+        ).use { cursor ->
+            val regionSeverityMap = linkedMapOf<String, Pair<String, Int>>()
+            while (cursor.moveToNext()) {
+                val severity = cursor.string("severity")
+                val rank = severityRank(severity)
+                val regions = jsonList(cursor.string("source_regions_json"))
+                for (region in regions) {
+                    val current = regionSeverityMap[region]
+                    if (current == null || rank > current.second) {
+                        regionSeverityMap[region] = severity to rank
+                    }
+                }
+            }
+            val regionSeverities = regionSeverityMap.map { (region, severityAndRank) ->
+                RegionSeverity(region = region, severity = severityAndRank.first, row_count = 0)
+            }
+            SeverityConsensusResult(
+                drug_a = foundDrugA,
+                drug_b = foundDrugB,
+                found = true,
+                rolled_up_severity = foundSeverity,
+                region_severities = regionSeverities,
+            )
+        }
+    }
+
+    override suspend fun findPairsByEffect(
+        effect: String,
+        limit: Int,
+    ): FindPairsByEffectResult = withContext(Dispatchers.IO) {
+        val normalizedEffect = normalizeLookupText(effect)
+        if (normalizedEffect.isBlank()) {
+            return@withContext FindPairsByEffectResult(effect_query = effect, pairs = emptyList())
+        }
+        val db = evidenceDb()
+        val pattern = "%$normalizedEffect%"
+        db.rawQuery(
+            """
+            SELECT ki.drug_a, ki.drug_b, ki.severity, kie.adverse_effect, kie.row_count
+            FROM known_interaction_effect kie
+            JOIN known_interaction ki ON ki.id = kie.known_interaction_id
+            WHERE lower(kie.adverse_effect) LIKE ?
+            ORDER BY kie.severity_rank DESC, kie.row_count DESC, ki.drug_a, ki.drug_b
+            LIMIT ?
+            """,
+            arrayOf(pattern, max(1, limit).toString()),
+        ).use { cursor ->
+            val pairs = buildList {
+                while (cursor.moveToNext()) {
+                    add(
+                        EffectPairMatch(
+                            drug_a = cursor.string("drug_a"),
+                            drug_b = cursor.string("drug_b"),
+                            severity = cursor.string("severity"),
+                            matching_effect = cursor.string("adverse_effect"),
+                            row_count = cursor.int("row_count"),
+                        ),
+                    )
+                }
+            }
+            FindPairsByEffectResult(effect_query = effect, pairs = pairs)
+        }
+    }
+
+    override suspend fun listImportIssues(
+        sourceFile: String?,
+        query: String?,
+        limit: Int,
+    ): List<ImportIssue> = withContext(Dispatchers.IO) {
+        val db = evidenceDb()
+        if (!tableExists(db, "ddi_import_issue")) {
+            return@withContext emptyList()
+        }
+
+        val clauses = mutableListOf<String>()
+        val params = mutableListOf<String>()
+
+        if (!sourceFile.isNullOrBlank()) {
+            clauses += "source_file = ?"
+            params += sourceFile
+        }
+        if (!query.isNullOrBlank()) {
+            val normalizedQuery = normalizeLookupText(query)
+            clauses += "(normalized_drug1 LIKE ? OR normalized_drug2 LIKE ? OR drug1 LIKE ? OR drug2 LIKE ?)"
+            val pattern = "%$normalizedQuery%"
+            val textPattern = "%${query.trim()}%"
+            params += listOf(pattern, pattern, textPattern, textPattern)
+        }
+
+        val where = if (clauses.isEmpty()) "" else "WHERE " + clauses.joinToString(" AND ")
+        params += max(1, limit).toString()
+
+        db.rawQuery(
+            """
+            SELECT source_file, row_number, drug1, drug2, normalized_drug1, normalized_drug2, reason
+            FROM ddi_import_issue
+            $where
+            ORDER BY source_file, row_number
+            LIMIT ?
+            """.trimIndent(),
+            params.toTypedArray(),
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(
+                        ImportIssue(
+                            source_file = cursor.string("source_file"),
+                            row_number = cursor.int("row_number"),
+                            drug1 = cursor.string("drug1"),
+                            drug2 = cursor.string("drug2"),
+                            normalized_drug1 = cursor.string("normalized_drug1"),
+                            normalized_drug2 = cursor.string("normalized_drug2"),
+                            reason = cursor.string("reason"),
                         ),
                     )
                 }
