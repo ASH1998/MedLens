@@ -52,6 +52,11 @@ Tools:
 - list_interactions_for_drug {"drug": "..."} — for "what interacts with X".
 - get_common_medicine_profile {"name": "..."} — for "what is X", brands, OTC/Rx.
 - search_drug_aliases {"query": "..."} — when a name does not normalize.
+- get_pair_effects {"drug_a": "...", "drug_b": "..."} — adverse effects for a specific pair.
+- get_raw_signals {"drug_a": "...", "drug_b": "..."} — raw DDI signal rows for a pair.
+- severity_consensus {"drug_a": "...", "drug_b": "..."} — per-region severity for a pair.
+- find_pairs_by_effect {"effect": "..."} — find pairs by adverse effect keyword.
+- list_import_issues {} — unresolved import rows for data-quality review.
 
 Typical flow for "is X with Y safe":
 1) CALL: build_structured_report {"medication_names": ["X","Y"]}
